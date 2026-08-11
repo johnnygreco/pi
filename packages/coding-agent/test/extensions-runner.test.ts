@@ -713,6 +713,38 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("before_user_message_commit", () => {
+		it("chains transformations and stops on cancellation", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("before_user_message_commit", async (event) => ({
+						action: "transform",
+						text: event.text + " first",
+					}));
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("before_user_message_commit", async (event) => {
+						if (event.text !== "hello first") throw new Error("text was not chained");
+						return { action: "cancel" };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "before-commit-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "before-commit-2.ts"), extCode2);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			expect(result.errors).toEqual([]);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, extensionContextActions);
+
+			await expect(runner.emitBeforeUserMessageCommit("hello", undefined, "interactive")).resolves.toEqual({
+				action: "cancel",
+			});
+		});
+	});
+
 	describe("before_agent_start", () => {
 		it("keeps ctx.getSystemPrompt() in sync with chained system prompt updates", async () => {
 			const extCode1 = `

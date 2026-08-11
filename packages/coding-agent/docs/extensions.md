@@ -287,6 +287,7 @@ user sends prompt ────────────────────�
   ├─► (extension commands checked first, bypass if found)  │
   ├─► input (can intercept, transform, or handle)          │
   ├─► (skill/template expansion if not handled)            │
+  ├─► before_user_message_commit (can cancel or transform rendered input)
   ├─► before_agent_start (can inject message, modify system prompt)
   ├─► agent_start                                          │
   ├─► message_start / message_update / message_end         │
@@ -520,7 +521,7 @@ pi.on("session_shutdown", async (event, ctx) => {
 
 #### before_agent_start
 
-Fired after user submits prompt, before agent loop. Can inject a message and/or modify the system prompt.
+Fired after user submits a prompt, before the agent loop. Can inject a message and/or modify the system prompt.
 
 ```typescript
 pi.on("before_agent_start", async (event, ctx) => {
@@ -890,7 +891,8 @@ Fired when user input is received, after extension commands are checked but befo
 2. `input` event fires - can intercept, transform, or handle
 3. If not handled: skill commands (`/skill:name`) expanded to skill content
 4. If not handled: prompt templates (`/template`) expanded to template content
-5. Agent processing begins (`before_agent_start`, etc.)
+5. When idle: `before_user_message_commit` fires with the rendered input
+6. Agent processing begins (`before_agent_start`, etc.)
 
 ```typescript
 pi.on("input", async (event, ctx) => {
@@ -929,6 +931,30 @@ pi.on("input", async (event, ctx) => {
 - `handled` - skip agent entirely (first handler to return this wins)
 
 Transforms chain across handlers. See [input-transform.ts](../examples/extensions/input-transform.ts) and [input-transform-streaming.ts](../examples/extensions/input-transform-streaming.ts) for `streamingBehavior`-aware routing.
+
+#### before_user_message_commit
+
+Fired for an idle submission after skill and prompt-template expansion, immediately before Pi constructs and persists the user message. Transformations chain across handlers. Returning `cancel` stops later handlers and prevents the submission from entering the session.
+
+```typescript
+pi.on("before_user_message_commit", async (event, ctx) => {
+  // event.text - rendered input, including skill/template expansion
+  // event.images - attached images, if any
+  // event.source - "interactive" | "rpc" | "extension"
+
+  if (event.text.includes("blocked")) {
+    ctx.ui.notify("Prompt blocked", "warning");
+    return { action: "cancel" };
+  }
+
+  return {
+    action: "transform",
+    text: event.text.replaceAll("secret", "[redacted]"),
+  };
+});
+```
+
+This hook is not fired for steering or follow-up input submitted while the agent is streaming. Use `input` and its `streamingBehavior` field when queued input also needs interception.
 
 ## ExtensionContext
 

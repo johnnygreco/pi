@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI, InputEvent } from "../../src/core/extensions/index.ts";
 import type { PromptTemplate } from "../../src/core/prompt-templates.ts";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
-import { createTestResourceLoader } from "../utilities.ts";
+import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 describe("AgentSession prompt characterization", () => {
@@ -189,6 +189,79 @@ describe("AgentSession prompt characterization", () => {
 		expect(expandedPrompt).toContain('<skill name="test" location="');
 		expect(expandedPrompt).toContain("Use the skill body.");
 		expect(expandedPrompt).toContain("explain this");
+	});
+
+	it("lets before_user_message_commit replace a rendered skill prompt before it is recorded", async () => {
+		const tempDir = join(tmpdir(), `pi-skill-admission-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+		tempDirs.push(tempDir);
+		const skillPath = join(tempDir, "test-skill.md");
+		writeFileSync(skillPath, "# Test Skill\n\nUse the skill body.");
+		let admittedPrompt = "";
+		const extensionsResult = await createTestExtensionsResult(
+			[
+				(pi) => {
+					pi.on("before_user_message_commit", (event) => {
+						admittedPrompt = event.text;
+						return { action: "transform", text: "redacted" };
+					});
+				},
+			],
+			tempDir,
+		);
+		const resourceLoader = {
+			...createTestResourceLoader({ extensionsResult }),
+			getSkills: () => ({
+				skills: [
+					{
+						name: "test",
+						description: "Test skill",
+						filePath: skillPath,
+						disableModelInvocation: false,
+						baseDir: tempDir,
+						sourceInfo: createSyntheticSourceInfo(skillPath, {
+							source: "local",
+							scope: "project",
+							origin: "top-level",
+							baseDir: tempDir,
+						}),
+					},
+				],
+				diagnostics: [],
+			}),
+		};
+		const harness = await createHarness({ resourceLoader });
+		harnesses.push(harness);
+		let providerPrompt = "";
+		harness.setResponses([
+			(context) => {
+				const user = context.messages.find((message) => message.role === "user");
+				providerPrompt = user ? getMessageText(user) : "";
+				return fauxAssistantMessage("ok");
+			},
+		]);
+
+		await harness.session.prompt("/skill:test secret");
+
+		expect(admittedPrompt).toContain("Use the skill body.");
+		expect(admittedPrompt).toContain("secret");
+		expect(providerPrompt).toBe("redacted");
+		expect(getMessageText(harness.session.messages[0]!)).toBe("redacted");
+	});
+
+	it("does not record a prompt cancelled by before_user_message_commit", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_user_message_commit", () => ({ action: "cancel" }));
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		await harness.session.prompt("denied");
+
+		expect(harness.session.messages).toEqual([]);
 	});
 
 	it("expands prompt templates before sending the prompt", async () => {
