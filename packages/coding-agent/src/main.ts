@@ -5,7 +5,6 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
-import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import chalk from "chalk";
@@ -33,15 +32,7 @@ import { listModels } from "./cli/list-models.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
-import {
-	APP_NAME,
-	ENV_SESSION_DIR,
-	expandTildePath,
-	getAgentDir,
-	getExamplesPath,
-	getPackageDir,
-	VERSION,
-} from "./config.ts";
+import { APP_NAME, ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, VERSION } from "./config.ts";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
 import {
 	type AgentSessionRuntimeDiagnostic,
@@ -77,7 +68,6 @@ import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
 const EXTENSION_LOAD_FAILURE_HINT = 'Hint: Start without extensions using "pi -ne".';
-const OPENSHELL_BRIDGE_URL_ENV = "OPENSHELL_PI_CONVERSATION_URL";
 
 /**
  * Read all content from piped stdin.
@@ -576,17 +566,6 @@ export interface MainOptions {
 	extensionFactories?: InlineExtension[];
 }
 
-export function resolveOpenShellAdmissionExtension(
-	bridgeUrl: string | undefined,
-	noExtensions: boolean | undefined,
-): string | undefined {
-	if (!bridgeUrl) return undefined;
-	if (noExtensions) {
-		throw new Error(`--no-extensions cannot be used when ${OPENSHELL_BRIDGE_URL_ENV} is set`);
-	}
-	return join(getExamplesPath(), "extensions", "openshell-input-admission.ts");
-}
-
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
@@ -628,18 +607,6 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	const parsed = parseArgs(args);
-	let openShellAdmissionExtension: string | undefined;
-	try {
-		openShellAdmissionExtension = resolveOpenShellAdmissionExtension(
-			process.env[OPENSHELL_BRIDGE_URL_ENV],
-			parsed.noExtensions,
-		);
-	} catch (error) {
-		parsed.diagnostics.push({
-			type: "error",
-			message: error instanceof Error ? error.message : "OpenShell admission configuration is invalid",
-		});
-	}
 	if (parsed.diagnostics.length > 0) {
 		for (const d of parsed.diagnostics) {
 			const color = d.type === "error" ? chalk.red : chalk.yellow;
@@ -741,10 +708,7 @@ export async function main(args: string[], options?: MainOptions) {
 	const trustPromptMode: AppMode = parsed.help || parsed.listModels !== undefined ? "print" : appMode;
 	const projectTrustByCwd = new Map<string, boolean>();
 
-	const resolvedExtensionPaths = resolveCliPaths(cwd, parsed.extensions) ?? [];
-	if (openShellAdmissionExtension) {
-		resolvedExtensionPaths.push(openShellAdmissionExtension);
-	}
+	const resolvedExtensionPaths = resolveCliPaths(cwd, parsed.extensions);
 	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
 	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
