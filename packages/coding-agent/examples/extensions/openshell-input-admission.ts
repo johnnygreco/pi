@@ -1,18 +1,20 @@
 /**
  * OpenShell direct-input admission.
  *
- * This MVP uses before_user_message_commit to admit one idle, text-only user
- * submission after rendering and before Pi persists it. It then attaches the
- * returned candidate receipt to the first provider request. Steering,
- * follow-ups, images, compaction, and post-tool continuations are unsupported
- * and fail closed.
+ * The CLI loads this bundled extension automatically when OpenShell sets
+ * OPENSHELL_PI_CONVERSATION_URL. This MVP uses before_user_message_commit to
+ * admit one idle, text-only user submission after rendering and before Pi
+ * persists it. It then attaches the returned candidate receipt to the first
+ * provider request. Steering, follow-ups, images, compaction, and post-tool
+ * continuations are unsupported and fail closed.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const BRIDGE_URL_ENV = "OPENSHELL_PI_CONVERSATION_URL";
 const RECEIPT_HEADER = "x-openshell-middleware-egress-receipt";
 const SCHEMA_VERSION = "openshell.pi-input.v1";
 const MAX_RESPONSE_BYTES = 256 * 1024;
+const MAX_RECEIPT_BYTES = 8 * 1024;
 
 interface BridgeResponse {
 	decision: "allow" | "deny";
@@ -30,12 +32,12 @@ export default function (pi: ExtensionAPI) {
 	let pendingReceipt: string | undefined;
 
 	pi.on("before_user_message_commit", async (event, ctx) => {
-		pendingReceipt = undefined;
-		if (!ctx.isIdle() || event.images?.length) {
-			ctx.ui.notify("OpenShell admission currently supports only idle, text-only prompts", "warning");
-			return { action: "cancel" };
-		}
 		try {
+			pendingReceipt = undefined;
+			if (!ctx.isIdle() || event.images?.length) {
+				notifySafely(ctx, "OpenShell admission currently supports only idle, text-only prompts");
+				return { action: "cancel" };
+			}
 			const bridgeUrl = process.env[BRIDGE_URL_ENV];
 			if (!bridgeUrl) throw new Error(`${BRIDGE_URL_ENV} is required for OpenShell admission`);
 			const envelope: CandidateEnvelope = { schema_version: SCHEMA_VERSION, text: event.text };
@@ -56,7 +58,7 @@ export default function (pi: ExtensionAPI) {
 			if (encoded.byteLength > MAX_RESPONSE_BYTES) throw new Error("OpenShell admission response is too large");
 			const result = parseBridgeResponse(JSON.parse(new TextDecoder().decode(encoded)));
 			if (result.decision === "deny") {
-				ctx.ui.notify(`OpenShell denied the prompt (${result.reason_code ?? "policy_denied"})`, "warning");
+				notifySafely(ctx, `OpenShell denied the prompt (${result.reason_code ?? "policy_denied"})`);
 				return { action: "cancel" };
 			}
 
@@ -65,7 +67,8 @@ export default function (pi: ExtensionAPI) {
 			const replacement = parseEnvelope(new Uint8Array(result.replacement_body));
 			return { action: "transform", text: replacement.text };
 		} catch {
-			ctx.ui.notify("OpenShell admission is unavailable", "warning");
+			pendingReceipt = undefined;
+			notifySafely(ctx, "OpenShell admission is unavailable");
 			return { action: "cancel" };
 		}
 	});
@@ -78,6 +81,14 @@ export default function (pi: ExtensionAPI) {
 		event.headers[RECEIPT_HEADER] = pendingReceipt;
 		pendingReceipt = undefined;
 	});
+}
+
+function notifySafely(ctx: ExtensionContext, message: string): void {
+	try {
+		ctx.ui.notify(message, "warning");
+	} catch {
+		// Admission remains fail closed when a UI implementation cannot notify.
+	}
 }
 
 function parseBridgeResponse(value: unknown): BridgeResponse {
@@ -108,7 +119,7 @@ function parseEnvelope(body: Uint8Array): CandidateEnvelope {
 }
 
 function decodeReceipt(value: number[] | undefined): string {
-	if (!value || value.length === 0 || value.length > 16 * 1024) {
+	if (!value || value.length === 0 || value.length > MAX_RECEIPT_BYTES) {
 		throw new Error("OpenShell admission receipt is invalid");
 	}
 	const receipt = new TextDecoder("ascii", { fatal: true }).decode(new Uint8Array(value));
