@@ -864,6 +864,23 @@ export type InputEventResult =
 	| { action: "transform"; text: string; images?: ImageContent[] }
 	| { action: "handled" };
 
+/** Fired after skill/template expansion, immediately before an idle user message is committed. */
+export interface BeforeUserMessageCommitEvent {
+	type: "before_user_message_commit";
+	/** The rendered input text. */
+	text: string;
+	/** Attached images, if any. */
+	images?: ImageContent[];
+	/** Where the input came from. */
+	source: InputSource;
+}
+
+/** Result from a before_user_message_commit event handler. */
+export type BeforeUserMessageCommitEventResult =
+	| { action: "continue" }
+	| { action: "transform"; text: string; images?: ImageContent[] }
+	| { action: "cancel" };
+
 // ============================================================================
 // Tool Events
 // ============================================================================
@@ -1089,6 +1106,7 @@ export type ExtensionEvent =
 	| ThinkingLevelSelectEvent
 	| UserBashEvent
 	| InputEvent
+	| BeforeUserMessageCommitEvent
 	| ToolCallEvent
 	| ToolResultEvent;
 
@@ -1277,6 +1295,10 @@ export interface ExtensionAPI {
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
+	on(
+		event: "before_user_message_commit",
+		handler: ExtensionHandler<BeforeUserMessageCommitEvent, BeforeUserMessageCommitEventResult>,
+	): void;
 
 	// =========================================================================
 	// Tool Registration

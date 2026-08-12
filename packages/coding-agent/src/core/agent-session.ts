@@ -1220,6 +1220,22 @@ export class AgentSession {
 				await this._checkCompaction(lastAssistant, false);
 			}
 
+			if (this._extensionRunner.hasHandlers("before_user_message_commit")) {
+				const commitResult = await this._extensionRunner.emitBeforeUserMessageCommit(
+					expandedText,
+					currentImages,
+					options?.source ?? "interactive",
+				);
+				if (commitResult.action === "cancel") {
+					preflightResult?.(false);
+					return;
+				}
+				if (commitResult.action === "transform") {
+					expandedText = commitResult.text;
+					currentImages = commitResult.images ?? currentImages;
+				}
+			}
+
 			// Build messages array (custom message if any, then user message)
 			messages = [];
 
