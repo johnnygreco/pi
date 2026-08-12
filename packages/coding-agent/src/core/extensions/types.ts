@@ -846,9 +846,9 @@ export type InputEventResult =
 	| { action: "transform"; text: string; images?: ImageContent[] }
 	| { action: "handled" };
 
-/** Fired after skill/template expansion, immediately before an idle user message is committed. */
-export interface BeforeUserMessageCommitEvent {
-	type: "before_user_message_commit";
+/** Fired after skill/template expansion, immediately before an idle user message is appended. */
+export interface BeforeUserMessageAppendEvent {
+	type: "before_user_message_append";
 	/** The rendered input text. */
 	text: string;
 	/** Attached images, if any. */
@@ -857,8 +857,8 @@ export interface BeforeUserMessageCommitEvent {
 	source: InputSource;
 }
 
-/** Result from a before_user_message_commit event handler. */
-export type BeforeUserMessageCommitEventResult =
+/** Result from a before_user_message_append event handler. */
+export type BeforeUserMessageAppendEventResult =
 	| { action: "continue" }
 	| { action: "transform"; text: string; images?: ImageContent[] }
 	| { action: "cancel" };
@@ -1072,7 +1072,7 @@ export type ExtensionEvent =
 	| ThinkingLevelSelectEvent
 	| UserBashEvent
 	| InputEvent
-	| BeforeUserMessageCommitEvent
+	| BeforeUserMessageAppendEvent
 	| ToolCallEvent
 	| ToolResultEvent;
 
@@ -1261,8 +1261,8 @@ export interface ExtensionAPI {
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
 	on(
-		event: "before_user_message_commit",
-		handler: ExtensionHandler<BeforeUserMessageCommitEvent, BeforeUserMessageCommitEventResult>,
+		event: "before_user_message_append",
+		handler: ExtensionHandler<BeforeUserMessageAppendEvent, BeforeUserMessageAppendEventResult>,
 	): void;
 
 	// =========================================================================

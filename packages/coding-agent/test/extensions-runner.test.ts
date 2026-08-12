@@ -713,11 +713,11 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
-	describe("before_user_message_commit", () => {
+	describe("before_user_message_append", () => {
 		it("chains transformations and stops on cancellation", async () => {
 			const extCode1 = `
 				export default function(pi) {
-					pi.on("before_user_message_commit", async (event) => ({
+					pi.on("before_user_message_append", async (event) => ({
 						action: "transform",
 						text: event.text + " first",
 					}));
@@ -725,7 +725,7 @@ describe("ExtensionRunner", () => {
 			`;
 			const extCode2 = `
 				export default function(pi) {
-					pi.on("before_user_message_commit", async (event) => {
+					pi.on("before_user_message_append", async (event) => {
 						if (event.text !== "hello first") throw new Error("text was not chained");
 						return { action: "cancel" };
 					});
@@ -739,7 +739,7 @@ describe("ExtensionRunner", () => {
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
 			runner.bindCore(extensionActions, extensionContextActions);
 
-			await expect(runner.emitBeforeUserMessageCommit("hello", undefined, "interactive")).resolves.toEqual({
+			await expect(runner.emitBeforeUserMessageAppend("hello", undefined, "interactive")).resolves.toEqual({
 				action: "cancel",
 			});
 		});
