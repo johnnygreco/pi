@@ -287,7 +287,7 @@ user sends prompt ────────────────────�
   ├─► (extension commands checked first, bypass if found)  │
   ├─► input (can intercept, transform, or handle)          │
   ├─► (skill/template expansion if not handled)            │
-  ├─► before_user_message_commit (can cancel or transform rendered input)
+  ├─► before_user_message_append (can cancel or transform rendered input)
   ├─► before_agent_start (can inject message, modify system prompt)
   ├─► agent_start                                          │
   ├─► message_start / message_update / message_end         │
@@ -900,7 +900,7 @@ Fired when user input is received, after extension commands are checked but befo
 2. `input` event fires - can intercept, transform, or handle
 3. If not handled: skill commands (`/skill:name`) expanded to skill content
 4. If not handled: prompt templates (`/template`) expanded to template content
-5. When idle: `before_user_message_commit` fires with the rendered input
+5. When idle: `before_user_message_append` fires with the rendered input
 6. Agent processing begins (`before_agent_start`, etc.)
 
 ```typescript
@@ -941,12 +941,12 @@ pi.on("input", async (event, ctx) => {
 
 Transforms chain across handlers. See [input-transform.ts](../examples/extensions/input-transform.ts) and [input-transform-streaming.ts](../examples/extensions/input-transform-streaming.ts) for `streamingBehavior`-aware routing.
 
-#### before_user_message_commit
+#### before_user_message_append
 
 Fired for an idle submission after skill and prompt-template expansion, immediately before Pi constructs and persists the user message. Transformations chain across handlers. Returning `cancel` stops later handlers and prevents the submission from entering the session.
 
 ```typescript
-pi.on("before_user_message_commit", async (event, ctx) => {
+pi.on("before_user_message_append", async (event, ctx) => {
   // event.text - rendered input, including skill/template expansion
   // event.images - attached images, if any
   // event.source - "interactive" | "rpc" | "extension"

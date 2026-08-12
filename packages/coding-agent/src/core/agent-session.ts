@@ -1220,19 +1220,19 @@ export class AgentSession {
 				await this._checkCompaction(lastAssistant, false);
 			}
 
-			if (this._extensionRunner.hasHandlers("before_user_message_commit")) {
-				const commitResult = await this._extensionRunner.emitBeforeUserMessageCommit(
+			if (this._extensionRunner.hasHandlers("before_user_message_append")) {
+				const appendResult = await this._extensionRunner.emitBeforeUserMessageAppend(
 					expandedText,
 					currentImages,
 					options?.source ?? "interactive",
 				);
-				if (commitResult.action === "cancel") {
+				if (appendResult.action === "cancel") {
 					preflightResult?.(false);
 					return;
 				}
-				if (commitResult.action === "transform") {
-					expandedText = commitResult.text;
-					currentImages = commitResult.images ?? currentImages;
+				if (appendResult.action === "transform") {
+					expandedText = appendResult.text;
+					currentImages = appendResult.images ?? currentImages;
 				}
 			}
 

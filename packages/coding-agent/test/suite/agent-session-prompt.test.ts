@@ -191,7 +191,7 @@ describe("AgentSession prompt characterization", () => {
 		expect(expandedPrompt).toContain("explain this");
 	});
 
-	it("lets before_user_message_commit replace a rendered skill prompt before it is recorded", async () => {
+	it("lets before_user_message_append replace a rendered skill prompt before it is recorded", async () => {
 		const tempDir = join(tmpdir(), `pi-skill-admission-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
 		tempDirs.push(tempDir);
@@ -201,7 +201,7 @@ describe("AgentSession prompt characterization", () => {
 		const extensionsResult = await createTestExtensionsResult(
 			[
 				(pi) => {
-					pi.on("before_user_message_commit", (event) => {
+					pi.on("before_user_message_append", (event) => {
 						admittedPrompt = event.text;
 						return { action: "transform", text: "redacted" };
 					});
@@ -249,11 +249,11 @@ describe("AgentSession prompt characterization", () => {
 		expect(getMessageText(harness.session.messages[0]!)).toBe("redacted");
 	});
 
-	it("does not record a prompt cancelled by before_user_message_commit", async () => {
+	it("does not record a prompt cancelled by before_user_message_append", async () => {
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
-					pi.on("before_user_message_commit", () => ({ action: "cancel" }));
+					pi.on("before_user_message_append", () => ({ action: "cancel" }));
 				},
 			],
 		});

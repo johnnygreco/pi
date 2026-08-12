@@ -39,8 +39,8 @@ export type {
 	BeforeProviderHeadersEvent,
 	BeforeProviderRequestEvent,
 	BeforeProviderRequestEventResult,
-	BeforeUserMessageCommitEvent,
-	BeforeUserMessageCommitEventResult,
+	BeforeUserMessageAppendEvent,
+	BeforeUserMessageAppendEventResult,
 	BuildSystemPromptOptions,
 	// Context
 	CompactOptions,
