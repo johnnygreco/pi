@@ -249,11 +249,16 @@ describe("AgentSession prompt characterization", () => {
 		expect(getMessageText(harness.session.messages[0]!)).toBe("redacted");
 	});
 
-	it("does not record a prompt cancelled by before_user_message_append", async () => {
+	it("cancels a rendered prompt before authentication, agent start, or persistence", async () => {
+		let beforeAgentStartCalls = 0;
 		const harness = await createHarness({
+			withConfiguredAuth: false,
 			extensionFactories: [
 				(pi) => {
 					pi.on("before_user_message_append", () => ({ action: "cancel" }));
+					pi.on("before_agent_start", () => {
+						beforeAgentStartCalls++;
+					});
 				},
 			],
 		});
@@ -262,6 +267,10 @@ describe("AgentSession prompt characterization", () => {
 		await harness.session.prompt("denied");
 
 		expect(harness.session.messages).toEqual([]);
+		expect(harness.sessionManager.getEntries()).toEqual([]);
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(beforeAgentStartCalls).toBe(0);
+		expect(harness.events.some((event) => event.type === "agent_start")).toBe(false);
 	});
 
 	it("expands prompt templates before sending the prompt", async () => {

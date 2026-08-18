@@ -943,7 +943,7 @@ Transforms chain across handlers. See [input-transform.ts](../examples/extension
 
 #### before_user_message_append
 
-Fired for an idle submission after skill and prompt-template expansion, immediately before Pi constructs and persists the user message. Transformations chain across handlers. Returning `cancel` stops later handlers and prevents the submission from entering the session.
+Fired for an idle submission after skill and prompt-template expansion, before authentication, compaction, or user-message construction. Transformations chain in extension load order: each handler receives the text and images returned by the previous handler. Returning `cancel` stops later handlers and prevents the submission from entering the session or starting the agent.
 
 ```typescript
 pi.on("before_user_message_append", async (event, ctx) => {
@@ -963,7 +963,9 @@ pi.on("before_user_message_append", async (event, ctx) => {
 });
 ```
 
-This hook is not fired for steering or follow-up input submitted while the agent is streaming. Use `input` and its `streamingBehavior` field when queued input also needs interception.
+Like other extension events, a handler error is reported and processing continues with the last successful value. An extension that must fail closed should catch its own errors and return `cancel`.
+
+This hook is a user-submission boundary, not a hook for every message role. It is not currently fired for steering or follow-up input submitted while the agent is streaming; use `input` and its `streamingBehavior` field when queued input also needs interception. Assistant messages, tool results, and automatic model continuations do not introduce a user submission. Use `context` or `before_provider_request` when every model call needs inspection or transformation.
 
 ## ExtensionContext
 

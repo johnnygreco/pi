@@ -1190,6 +1190,22 @@ export class AgentSession {
 				return;
 			}
 
+			if (this._extensionRunner.hasHandlers("before_user_message_append")) {
+				const appendResult = await this._extensionRunner.emitBeforeUserMessageAppend(
+					expandedText,
+					currentImages,
+					options?.source ?? "interactive",
+				);
+				if (appendResult.action === "cancel") {
+					preflightResult?.(true);
+					return;
+				}
+				if (appendResult.action === "transform") {
+					expandedText = appendResult.text;
+					currentImages = appendResult.images ?? currentImages;
+				}
+			}
+
 			// Flush any pending bash messages before the new prompt
 			this._flushPendingBashMessages();
 
@@ -1218,22 +1234,6 @@ export class AgentSession {
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
 				await this._checkCompaction(lastAssistant, false);
-			}
-
-			if (this._extensionRunner.hasHandlers("before_user_message_append")) {
-				const appendResult = await this._extensionRunner.emitBeforeUserMessageAppend(
-					expandedText,
-					currentImages,
-					options?.source ?? "interactive",
-				);
-				if (appendResult.action === "cancel") {
-					preflightResult?.(false);
-					return;
-				}
-				if (appendResult.action === "transform") {
-					expandedText = appendResult.text;
-					currentImages = appendResult.images ?? currentImages;
-				}
 			}
 
 			// Build messages array (custom message if any, then user message)

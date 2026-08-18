@@ -751,8 +751,8 @@ describe("ExtensionRunner", () => {
 					});
 				}
 			`;
-			fs.writeFileSync(path.join(extensionsDir, "before-commit-1.ts"), extCode1);
-			fs.writeFileSync(path.join(extensionsDir, "before-commit-2.ts"), extCode2);
+			fs.writeFileSync(path.join(extensionsDir, "before-append-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "before-append-2.ts"), extCode2);
 
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			expect(result.errors).toEqual([]);
@@ -762,6 +762,40 @@ describe("ExtensionRunner", () => {
 			await expect(runner.emitBeforeUserMessageAppend("hello", undefined, "interactive")).resolves.toEqual({
 				action: "cancel",
 			});
+		});
+
+		it("reports handler errors and continues with later handlers", async () => {
+			const throwingExtension = `
+				export default function(pi) {
+					pi.on("before_user_message_append", async () => {
+						throw new Error("append failed");
+					});
+				}
+			`;
+			const transformingExtension = `
+				export default function(pi) {
+					pi.on("before_user_message_append", async (event) => ({
+						action: "transform",
+						text: event.text + " transformed",
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "before-append-throws.ts"), throwingExtension);
+			fs.writeFileSync(path.join(extensionsDir, "before-append-transforms.ts"), transformingExtension);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			expect(result.errors).toEqual([]);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, extensionContextActions);
+			const errors: Array<{ event: string; error: string }> = [];
+			runner.onError((error) => errors.push(error));
+
+			await expect(runner.emitBeforeUserMessageAppend("hello", undefined, "interactive")).resolves.toEqual({
+				action: "transform",
+				text: "hello transformed",
+				images: undefined,
+			});
+			expect(errors).toMatchObject([{ event: "before_user_message_append", error: "append failed" }]);
 		});
 	});
 
