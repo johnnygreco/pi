@@ -764,7 +764,15 @@ describe("ExtensionRunner", () => {
 			});
 		});
 
-		it("reports handler errors and continues with later handlers", async () => {
+		it("reports handler errors and continues from the last successful transformation", async () => {
+			const firstTransformation = `
+				export default function(pi) {
+					pi.on("before_user_message_append", async (event) => ({
+						action: "transform",
+						text: event.text + " first",
+					}));
+				}
+			`;
 			const throwingExtension = `
 				export default function(pi) {
 					pi.on("before_user_message_append", async () => {
@@ -772,16 +780,17 @@ describe("ExtensionRunner", () => {
 					});
 				}
 			`;
-			const transformingExtension = `
+			const laterTransformation = `
 				export default function(pi) {
 					pi.on("before_user_message_append", async (event) => ({
 						action: "transform",
-						text: event.text + " transformed",
+						text: event.text + " later",
 					}));
 				}
 			`;
-			fs.writeFileSync(path.join(extensionsDir, "before-append-throws.ts"), throwingExtension);
-			fs.writeFileSync(path.join(extensionsDir, "before-append-transforms.ts"), transformingExtension);
+			fs.writeFileSync(path.join(extensionsDir, "before-append-1-transform.ts"), firstTransformation);
+			fs.writeFileSync(path.join(extensionsDir, "before-append-2-throws.ts"), throwingExtension);
+			fs.writeFileSync(path.join(extensionsDir, "before-append-3-transform.ts"), laterTransformation);
 
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			expect(result.errors).toEqual([]);
@@ -792,7 +801,7 @@ describe("ExtensionRunner", () => {
 
 			await expect(runner.emitBeforeUserMessageAppend("hello", undefined, "interactive")).resolves.toEqual({
 				action: "transform",
-				text: "hello transformed",
+				text: "hello first later",
 				images: undefined,
 			});
 			expect(errors).toMatchObject([{ event: "before_user_message_append", error: "append failed" }]);

@@ -864,7 +864,7 @@ export type InputEventResult =
 	| { action: "transform"; text: string; images?: ImageContent[] }
 	| { action: "handled" };
 
-/** Fired after skill/template expansion, immediately before an idle user message is appended. */
+/** Fired after skill/template expansion, before idle-submission preflight and user-message construction. */
 export interface BeforeUserMessageAppendEvent {
 	type: "before_user_message_append";
 	/** The rendered input text. */
