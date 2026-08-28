@@ -210,7 +210,7 @@ async function runLoop(
 				// them all instead of executing potentially borked calls.
 				const executedToolBatch =
 					message.stopReason === "length"
-						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+						? await failToolCallsFromTruncatedMessage(toolCalls, config, signal, emit)
 						: await executeToolCalls(currentContext, message, config, signal, emit);
 				toolResults.push(...executedToolBatch.messages);
 				hasMoreToolCalls = !executedToolBatch.terminate;
@@ -380,6 +380,8 @@ async function streamAssistantResponse(
  */
 async function failToolCallsFromTruncatedMessage(
 	toolCalls: AgentToolCall[],
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const messages: ToolResultMessage[] = [];
@@ -398,7 +400,7 @@ async function failToolCallsFromTruncatedMessage(
 			isError: true,
 		};
 		await emitToolExecutionEnd(finalized, emit);
-		const toolResultMessage = createToolResultMessage(finalized);
+		const toolResultMessage = await prepareToolResultMessage(finalized, config, signal);
 		await emitToolResultMessage(toolResultMessage, emit);
 		messages.push(toolResultMessage);
 	}
@@ -470,7 +472,7 @@ async function executeToolCallsSequential(
 		}
 
 		await emitToolExecutionEnd(finalized, emit);
-		const toolResultMessage = createToolResultMessage(finalized);
+		const toolResultMessage = await prepareToolResultMessage(finalized, config, signal);
 		await emitToolResultMessage(toolResultMessage, emit);
 		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
@@ -542,7 +544,7 @@ async function executeToolCallsParallel(
 	);
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
-		const toolResultMessage = createToolResultMessage(finalized);
+		const toolResultMessage = await prepareToolResultMessage(finalized, config, signal);
 		await emitToolResultMessage(toolResultMessage, emit);
 		messages.push(toolResultMessage);
 	}
@@ -788,6 +790,15 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 		isError: finalized.isError,
 		timestamp: Date.now(),
 	};
+}
+
+async function prepareToolResultMessage(
+	finalized: FinalizedToolCallOutcome,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+): Promise<ToolResultMessage> {
+	const message = createToolResultMessage(finalized);
+	return config.beforeToolResultAppend ? await config.beforeToolResultAppend(message, signal) : message;
 }
 
 async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {

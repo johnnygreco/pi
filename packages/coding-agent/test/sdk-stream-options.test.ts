@@ -4,11 +4,14 @@ import { join } from "node:path";
 import {
 	type Api,
 	type AssistantMessage,
+	type Context,
 	createAssistantMessageEventStream,
 	type Model,
 	type SimpleStreamOptions,
+	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { ContextAdmission } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -79,6 +82,8 @@ describe("createAgentSession stream options", () => {
 		settings: Partial<Settings>,
 		requestOptions: SimpleStreamOptions = {},
 		extensionSource?: string,
+		contextAdmission?: ContextAdmission,
+		context: Context = { messages: [] },
 	): Promise<SimpleStreamOptions | undefined> {
 		const model = createModel(api);
 		const settingsManager = SettingsManager.inMemory(settings);
@@ -111,10 +116,11 @@ describe("createAgentSession stream options", () => {
 			modelRuntime,
 			settingsManager,
 			sessionManager,
+			contextAdmission,
 		});
 
 		try {
-			const stream = await session.agent.streamFunction(model, { messages: [] }, requestOptions);
+			const stream = await session.agent.streamFunction(model, context, requestOptions);
 			await stream.result();
 			return capturedOptions;
 		} finally {
@@ -193,5 +199,49 @@ describe("createAgentSession stream options", () => {
 			"x-hook": "provider:model:explicit",
 		});
 		expect(options).not.toHaveProperty("transformHeaders");
+	});
+
+	it("uses the outbound context to keep a queued admission handle off an earlier request retry", async () => {
+		const firstMessage: UserMessage = {
+			role: "user",
+			content: [{ type: "text", text: "first" }],
+			timestamp: 1,
+		};
+		const queuedMessage: UserMessage = {
+			role: "user",
+			content: [{ type: "text", text: "queued" }],
+			timestamp: 2,
+		};
+		const handles = new Map<string, string>();
+		let nextHandle = "handle-first";
+		const admission: ContextAdmission = {
+			admitUserMessage: async (message) => {
+				handles.set(JSON.stringify(message.content), nextHandle);
+				return { action: "allow" };
+			},
+			admitToolResult: async () => ({ action: "allow" }),
+			transformProviderHeaders: async (headers, context) => {
+				let candidate: (typeof context.messages)[number] | undefined;
+				for (let i = context.messages.length - 1; i >= 0; i--) {
+					const message = context.messages[i];
+					if (message.role === "user" || message.role === "toolResult") {
+						candidate = message;
+						break;
+					}
+				}
+				const handle = candidate ? handles.get(JSON.stringify(candidate.content)) : undefined;
+				return handle ? { ...headers, "x-admission": handle } : headers;
+			},
+		};
+
+		await admission.admitUserMessage(firstMessage, { source: "interactive" });
+		nextHandle = "handle-queued";
+		await admission.admitUserMessage(queuedMessage, { source: "interactive" });
+
+		const options = await captureStreamOptions("openai-completions", {}, {}, undefined, admission, {
+			messages: [firstMessage],
+		});
+
+		expect(options?.headers?.["x-admission"]).toBe("handle-first");
 	});
 });

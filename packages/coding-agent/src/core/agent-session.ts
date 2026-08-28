@@ -28,11 +28,14 @@ import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
+	Context,
 	ImageContent,
 	Model,
 	ProviderHeaders,
 	TextContent,
+	ToolResultMessage,
 	Usage,
+	UserMessage,
 } from "@earendil-works/pi-ai/compat";
 import {
 	clampThinkingLevel,
@@ -227,6 +230,20 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Mandatory admission boundary for managed runtimes. */
+	contextAdmission?: ContextAdmission;
+}
+
+export type ContextAdmissionResult<T> = { action: "allow"; message?: T } | { action: "deny"; reason?: string };
+
+export interface ContextAdmission {
+	admitUserMessage(
+		message: UserMessage,
+		context: { source: InputSource },
+	): Promise<ContextAdmissionResult<UserMessage>>;
+	admitToolResult(message: ToolResultMessage): Promise<ContextAdmissionResult<ToolResultMessage>>;
+	/** Transform headers for the exact context of the outbound provider request. */
+	transformProviderHeaders?(headers: ProviderHeaders, context: Context): Promise<ProviderHeaders>;
 }
 
 export interface ExtensionBindings {
@@ -358,6 +375,7 @@ export class AgentSession {
 	private _excludedToolNames?: Set<string>;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
+	private _contextAdmission?: ContextAdmission;
 	private _extensionUIContext?: ExtensionUIContext;
 	private _extensionMode: ExtensionMode = "print";
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
@@ -394,6 +412,7 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._contextAdmission = config.contextAdmission;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -535,6 +554,29 @@ export class AgentSession {
 				usage: hookResult?.usage,
 			};
 		};
+
+		if (this._contextAdmission) {
+			const contextAdmission = this._contextAdmission;
+			this.agent.beforeToolResultAppend = async (message) => {
+				try {
+					const result = await contextAdmission.admitToolResult(message);
+					if (result.action === "allow") {
+						return result.message ?? message;
+					}
+				} catch {
+					// Admission failures are denied below.
+				}
+
+				return {
+					role: "toolResult",
+					toolCallId: message.toolCallId,
+					toolName: message.toolName,
+					content: [{ type: "text", text: "[Tool result blocked by context admission]" }],
+					isError: true,
+					timestamp: message.timestamp,
+				};
+			};
+		}
 	}
 
 	private _installAgentNextTurnRefresh(): void {
@@ -1115,6 +1157,40 @@ export class AgentSession {
 		return this.agent.hasQueuedMessages();
 	}
 
+	private async _admitUserMessage(
+		text: string,
+		images: ImageContent[] | undefined,
+		source: InputSource,
+	): Promise<UserMessage> {
+		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
+		if (images) {
+			content.push(...images);
+		}
+		const message: UserMessage = { role: "user", content, timestamp: Date.now() };
+		if (!this._contextAdmission) {
+			return message;
+		}
+		const result = await this._contextAdmission.admitUserMessage(message, { source });
+		if (result.action === "deny") {
+			throw new Error(result.reason ?? "Message blocked by context admission");
+		}
+		return result.message ?? message;
+	}
+
+	private _getUserMessageParts(message: UserMessage): { text: string; images?: ImageContent[] } {
+		if (typeof message.content === "string") {
+			return { text: message.content };
+		}
+		const images = message.content.filter((part): part is ImageContent => part.type === "image");
+		return {
+			text: message.content
+				.filter((part): part is TextContent => part.type === "text")
+				.map((part) => part.text)
+				.join("\n"),
+			images: images.length > 0 ? images : undefined,
+		};
+	}
+
 	/**
 	 * Send a prompt to the agent.
 	 * - Handles extension commands (registered via pi.registerCommand) immediately, even during streaming
@@ -1196,12 +1272,21 @@ export class AgentSession {
 				}
 			}
 
+			const admittedMessage = await this._admitUserMessage(
+				expandedText,
+				currentImages,
+				options?.source ?? "interactive",
+			);
+			const admittedParts = this._getUserMessageParts(admittedMessage);
+			expandedText = admittedParts.text;
+			currentImages = admittedParts.images;
+
 			// If streaming, queue the admitted message via steer() or followUp().
 			if (this.isStreaming) {
 				if (streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					this._queueFollowUp(admittedMessage);
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					this._queueSteer(admittedMessage);
 				}
 				preflightResult?.(true);
 				return;
@@ -1240,16 +1325,8 @@ export class AgentSession {
 			// Build messages array (custom message if any, then user message)
 			messages = [];
 
-			// Add user message
-			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
-			if (currentImages) {
-				userContent.push(...currentImages);
-			}
-			messages.push({
-				role: "user",
-				content: userContent,
-				timestamp: Date.now(),
-			});
+			// Add admitted user message
+			messages.push(admittedMessage);
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this._pendingNextTurnMessages) {
@@ -1378,7 +1455,8 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueSteer(expandedText, images);
+		const admittedMessage = await this._admitUserMessage(expandedText, images, "interactive");
+		this._queueSteer(admittedMessage);
 	}
 
 	/**
@@ -1398,41 +1476,28 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueFollowUp(expandedText, images);
+		const admittedMessage = await this._admitUserMessage(expandedText, images, "interactive");
+		this._queueFollowUp(admittedMessage);
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private _queueSteer(message: UserMessage): void {
+		const text = contentText(message.content, "");
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
-		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		this.agent.steer(message);
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private _queueFollowUp(message: UserMessage): void {
+		const text = contentText(message.content, "");
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
-		}
-		this.agent.followUp({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		this.agent.followUp(message);
 	}
 
 	/**

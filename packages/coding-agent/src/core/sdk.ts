@@ -3,7 +3,7 @@ import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { AgentSession } from "./agent-session.ts";
+import { AgentSession, type ContextAdmission } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
@@ -85,6 +85,8 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Mandatory admission boundary for managed runtimes. */
+	contextAdmission?: ContextAdmission;
 }
 
 /** Result from createAgentSession */
@@ -302,6 +304,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
+	const contextAdmission = options.contextAdmission;
 
 	agent = new Agent({
 		initialState: {
@@ -334,9 +337,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						options?.sessionId,
 						requestHeaders,
 					);
-					return headerRunner?.hasHandlers("before_provider_headers")
+					const extensionHeaders = headerRunner?.hasHandlers("before_provider_headers")
 						? headerRunner.emitBeforeProviderHeaders(headers ?? {})
 						: (headers ?? {});
+					const resolvedHeaders = await extensionHeaders;
+					return contextAdmission?.transformProviderHeaders
+						? contextAdmission.transformProviderHeaders(resolvedHeaders, context)
+						: resolvedHeaders;
 				},
 			});
 		},
@@ -399,6 +406,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
+		contextAdmission: options.contextAdmission,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 
