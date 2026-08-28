@@ -478,6 +478,59 @@ describe("AgentSession prompt characterization", () => {
 		await promptPromise;
 	});
 
+	it("admits and transforms a rendered message before queueing it", async () => {
+		let releaseToolExecution: (() => void) | undefined;
+		const toolRelease = new Promise<void>((resolve) => {
+			releaseToolExecution = resolve;
+		});
+		const admittedPrompts: string[] = [];
+		const waitTool: AgentTool = {
+			name: "wait",
+			label: "Wait",
+			description: "Wait for release",
+			parameters: Type.Object({}),
+			execute: async () => {
+				await toolRelease;
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const harness = await createHarness({
+			tools: [waitTool],
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_user_message_append", (event) => {
+						admittedPrompts.push(event.text);
+						return event.text === "queued secret" ? { action: "transform", text: "queued redacted" } : undefined;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+
+		const sawToolStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "tool_execution_start") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+
+		const promptPromise = harness.session.prompt("start");
+		await sawToolStart;
+		await harness.session.prompt("queued secret", { streamingBehavior: "steer" });
+		releaseToolExecution?.();
+		await promptPromise;
+
+		expect(admittedPrompts).toEqual(["start", "queued secret"]);
+		expect(harness.session.messages.some((message) => getMessageText(message) === "queued redacted")).toBe(true);
+		expect(harness.session.messages.some((message) => getMessageText(message) === "queued secret")).toBe(false);
+	});
+
 	it("throws when prompted during streaming without a streamingBehavior", async () => {
 		let releaseToolExecution: (() => void) | undefined;
 		const toolRelease = new Promise<void>((resolve) => {

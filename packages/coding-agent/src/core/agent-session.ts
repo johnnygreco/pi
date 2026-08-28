@@ -1173,21 +1173,11 @@ export class AgentSession {
 				expandedText = this._expandSkillCommand(expandedText);
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
-
-			// If streaming, queue via steer() or followUp() based on option
-			if (this.isStreaming) {
-				if (!options?.streamingBehavior) {
-					throw new Error(
-						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
-					);
-				}
-				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
-				} else {
-					await this._queueSteer(expandedText, currentImages);
-				}
-				preflightResult?.(true);
-				return;
+			const streamingBehavior = options?.streamingBehavior;
+			if (this.isStreaming && !streamingBehavior) {
+				throw new Error(
+					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+				);
 			}
 
 			if (this._extensionRunner.hasHandlers("before_user_message_append")) {
@@ -1204,6 +1194,17 @@ export class AgentSession {
 					expandedText = appendResult.text;
 					currentImages = appendResult.images ?? currentImages;
 				}
+			}
+
+			// If streaming, queue the admitted message via steer() or followUp().
+			if (this.isStreaming) {
+				if (streamingBehavior === "followUp") {
+					await this._queueFollowUp(expandedText, currentImages);
+				} else {
+					await this._queueSteer(expandedText, currentImages);
+				}
+				preflightResult?.(true);
+				return;
 			}
 
 			// Flush any pending bash messages before the new prompt
