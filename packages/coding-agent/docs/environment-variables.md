@@ -82,6 +82,8 @@ These variables are read by Pi itself:
 | `PI_CODING_AGENT_SESSION_DIR` | Override session storage; overridden by `--session-dir` |
 | `PI_PACKAGE_DIR` | Override the package directory, useful for Nix/Guix store paths |
 | `PI_OFFLINE` | Disable startup network operations, including update checks, package updates, and install/update telemetry |
+| `PI_OPENSHELL_CONTEXT_ADMISSION` | Set to `1` to require OpenShell context admission for every Pi session; requires `OPENSHELL_AGENT_CONVERSATION_URL` |
+| `OPENSHELL_AGENT_CONVERSATION_URL` | OpenShell sandbox-local admission bridge used when `PI_OPENSHELL_CONTEXT_ADMISSION=1` |
 | `PI_SKIP_VERSION_CHECK` | Disable the `pi.dev` latest-version request |
 | `PI_TELEMETRY` | Override install/update telemetry and provider attribution headers: `1`/`true`/`yes` or `0`/`false`/`no` |
 | `PI_CACHE_RETENTION` | Set to `long` for extended provider prompt caching where supported |
