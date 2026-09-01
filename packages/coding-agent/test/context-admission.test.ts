@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AgentSession, type ContextAdmission } from "../src/core/agent-session.ts";
+import { AgentSession, type ContextAdmission, ContextAdmissionDeniedError } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -90,7 +90,7 @@ describe("managed context admission", () => {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
-		const sessionManager = SessionManager.inMemory(tempDir);
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
 		session = new AgentSession({
 			agent,
 			sessionManager,
@@ -118,6 +118,7 @@ describe("managed context admission", () => {
 					message: { ...message, content: [{ type: "text", text: "admitted prompt" }] },
 				}),
 				admitToolResult: async () => ({ action: "allow" }),
+				admitProviderContext: async () => ({ action: "allow" }),
 			},
 		);
 
@@ -127,6 +128,37 @@ describe("managed context admission", () => {
 		expect(providerInputs[0]).not.toContain("raw prompt");
 		expect(JSON.stringify(sessionManager.getEntries())).toContain("admitted prompt");
 		expect(JSON.stringify(sessionManager.getEntries())).not.toContain("raw prompt");
+	});
+
+	it("does not append a denied idle prompt to context or JSONL", async () => {
+		let providerCalls = 0;
+		const { session, sessionManager } = await createSession(
+			() => {
+				providerCalls++;
+				return completedStream(assistantMessage([{ type: "text", text: "done" }]));
+			},
+			{
+				admitUserMessage: async (message) =>
+					JSON.stringify(message).includes("denied")
+						? { action: "deny", reason: "test policy" }
+						: { action: "allow" },
+				admitToolResult: async () => ({ action: "allow" }),
+				admitProviderContext: async () => ({ action: "allow" }),
+			},
+		);
+
+		await session.prompt("allowed");
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		const beforeDenial = readFileSync(sessionFile, "utf8");
+
+		const denied = session.prompt("denied idle prompt");
+		await expect(denied).rejects.toBeInstanceOf(ContextAdmissionDeniedError);
+		await expect(denied).rejects.toThrow("test policy");
+
+		expect(providerCalls).toBe(1);
+		expect(JSON.stringify(session.messages)).not.toContain("denied idle prompt");
+		expect(readFileSync(sessionFile, "utf8")).toBe(beforeDenial);
 	});
 
 	it("does not queue or persist denied steering and follow-up prompts", async () => {
@@ -147,6 +179,7 @@ describe("managed context admission", () => {
 				admitUserMessage: async (message) =>
 					JSON.stringify(message).includes("denied") ? { action: "deny" } : { action: "allow" },
 				admitToolResult: async () => ({ action: "allow" }),
+				admitProviderContext: async () => ({ action: "allow" }),
 			},
 		);
 
@@ -154,11 +187,11 @@ describe("managed context admission", () => {
 		while (!releaseFirstResponse) {
 			await new Promise((resolve) => setTimeout(resolve, 0));
 		}
-		await expect(session.prompt("denied steer", { streamingBehavior: "steer" })).rejects.toThrow(
-			"Message blocked by context admission",
+		await expect(session.prompt("denied steer", { streamingBehavior: "steer" })).rejects.toBeInstanceOf(
+			ContextAdmissionDeniedError,
 		);
-		await expect(session.prompt("denied follow-up", { streamingBehavior: "followUp" })).rejects.toThrow(
-			"Message blocked by context admission",
+		await expect(session.prompt("denied follow-up", { streamingBehavior: "followUp" })).rejects.toBeInstanceOf(
+			ContextAdmissionDeniedError,
 		);
 		expect(session.pendingMessageCount).toBe(0);
 		releaseFirstResponse();
@@ -196,6 +229,7 @@ describe("managed context admission", () => {
 								}
 							: { action: "allow" },
 					admitToolResult: async () => ({ action: "allow" }),
+					admitProviderContext: async () => ({ action: "allow" }),
 				},
 			);
 
@@ -237,6 +271,7 @@ describe("managed context admission", () => {
 			{
 				admitUserMessage: async () => ({ action: "allow" }),
 				admitToolResult: async () => ({ action: "deny" }),
+				admitProviderContext: async () => ({ action: "allow" }),
 			},
 			{ probe: tool },
 		);
@@ -271,6 +306,7 @@ describe("managed context admission", () => {
 					throw new Error("admission unavailable");
 				},
 				admitToolResult: async () => ({ action: "allow" }),
+				admitProviderContext: async () => ({ action: "allow" }),
 			},
 		);
 

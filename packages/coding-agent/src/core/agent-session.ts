@@ -236,14 +236,30 @@ export interface AgentSessionConfig {
 
 export type ContextAdmissionResult<T> = { action: "allow"; message?: T } | { action: "deny"; reason?: string };
 
+export type ProviderContextAdmissionResult =
+	| { action: "allow"; context?: Context }
+	| { action: "deny"; reason?: string };
+
 export interface ContextAdmission {
 	admitUserMessage(
 		message: UserMessage,
 		context: { source: InputSource },
 	): Promise<ContextAdmissionResult<UserMessage>>;
 	admitToolResult(message: ToolResultMessage): Promise<ContextAdmissionResult<ToolResultMessage>>;
+	/** Admit the exact context immediately before any provider request is serialized. */
+	admitProviderContext(context: Context): Promise<ProviderContextAdmissionResult>;
 	/** Transform headers for the exact context of the outbound provider request. */
 	transformProviderHeaders?(headers: ProviderHeaders, context: Context): Promise<ProviderHeaders>;
+}
+
+export class ContextAdmissionDeniedError extends Error {
+	readonly reason?: string;
+
+	constructor(reason?: string) {
+		super(reason ?? "Message blocked by context admission");
+		this.name = "ContextAdmissionDeniedError";
+		this.reason = reason;
+	}
 }
 
 export interface ExtensionBindings {
@@ -1172,7 +1188,7 @@ export class AgentSession {
 		}
 		const result = await this._contextAdmission.admitUserMessage(message, { source });
 		if (result.action === "deny") {
-			throw new Error(result.reason ?? "Message blocked by context admission");
+			throw new ContextAdmissionDeniedError(result.reason);
 		}
 		return result.message ?? message;
 	}

@@ -18,10 +18,12 @@ export {
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
 	type ContextAdmission,
+	ContextAdmissionDeniedError,
 	type ContextAdmissionResult,
 	type ModelCycleResult,
 	type ParsedSkillBlock,
 	type PromptOptions,
+	type ProviderContextAdmissionResult,
 	parseSkillBlock,
 	type SessionStats,
 } from "./core/agent-session.ts";

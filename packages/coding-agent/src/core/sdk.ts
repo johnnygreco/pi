@@ -3,7 +3,7 @@ import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { AgentSession, type ContextAdmission } from "./agent-session.ts";
+import { AgentSession, type ContextAdmission, ContextAdmissionDeniedError } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
@@ -315,6 +315,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
+			const providerAdmission = contextAdmission
+				? await contextAdmission.admitProviderContext(context)
+				: { action: "allow" as const };
+			if (providerAdmission.action === "deny") {
+				throw new ContextAdmissionDeniedError(providerAdmission.reason);
+			}
+			const providerContext = providerAdmission.context ?? context;
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
 			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 			// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
@@ -324,7 +331,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const headerRunner = extensionRunnerRef.current;
-			return modelRuntime.streamSimple(model, context, {
+			return modelRuntime.streamSimple(model, providerContext, {
 				...options,
 				timeoutMs,
 				websocketConnectTimeoutMs,
@@ -342,7 +349,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						: (headers ?? {});
 					const resolvedHeaders = await extensionHeaders;
 					return contextAdmission?.transformProviderHeaders
-						? contextAdmission.transformProviderHeaders(resolvedHeaders, context)
+						? contextAdmission.transformProviderHeaders(resolvedHeaders, providerContext)
 						: resolvedHeaders;
 				},
 			});

@@ -84,6 +84,7 @@ describe("createAgentSession stream options", () => {
 		extensionSource?: string,
 		contextAdmission?: ContextAdmission,
 		context: Context = { messages: [] },
+		captureContext?: (context: Context) => void,
 	): Promise<SimpleStreamOptions | undefined> {
 		const model = createModel(api);
 		const settingsManager = SettingsManager.inMemory(settings);
@@ -101,7 +102,8 @@ describe("createAgentSession stream options", () => {
 		modelRegistry.registerProvider(model.provider, {
 			api,
 			headers: { "x-provider": "provider" },
-			streamSimple: (_model, _context, providerOptions) => {
+			streamSimple: (_model, providerContext, providerOptions) => {
+				captureContext?.(providerContext);
 				capturedOptions = providerOptions;
 				return createDoneStream(api);
 			},
@@ -220,6 +222,7 @@ describe("createAgentSession stream options", () => {
 				return { action: "allow" };
 			},
 			admitToolResult: async () => ({ action: "allow" }),
+			admitProviderContext: async () => ({ action: "allow" }),
 			transformProviderHeaders: async (headers, context) => {
 				let candidate: (typeof context.messages)[number] | undefined;
 				for (let i = context.messages.length - 1; i >= 0; i--) {
@@ -243,5 +246,58 @@ describe("createAgentSession stream options", () => {
 		});
 
 		expect(options?.headers?.["x-admission"]).toBe("handle-first");
+	});
+
+	it("admits a generated provider context before serialization and header transformation", async () => {
+		const generated: Context = {
+			messages: [{ role: "user", content: [{ type: "text", text: "generated" }], timestamp: 1 }],
+		};
+		const admitted: Context = {
+			messages: [{ role: "user", content: [{ type: "text", text: "admitted" }], timestamp: 1 }],
+		};
+		let serializedContext: Context | undefined;
+		const admission: ContextAdmission = {
+			admitUserMessage: async () => ({ action: "allow" }),
+			admitToolResult: async () => ({ action: "allow" }),
+			admitProviderContext: async (context) => {
+				expect(context).toBe(generated);
+				return { action: "allow", context: admitted };
+			},
+			transformProviderHeaders: async (headers, context) => {
+				expect(context).toBe(admitted);
+				return { ...headers, "x-admission": "generated-handle" };
+			},
+		};
+
+		const options = await captureStreamOptions(
+			"openai-completions",
+			{},
+			{},
+			undefined,
+			admission,
+			generated,
+			(context) => {
+				serializedContext = context;
+			},
+		);
+
+		expect(serializedContext).toBe(admitted);
+		expect(options?.headers?.["x-admission"]).toBe("generated-handle");
+	});
+
+	it("does not call the provider when outbound context admission denies", async () => {
+		let providerCalled = false;
+		const admission: ContextAdmission = {
+			admitUserMessage: async () => ({ action: "allow" }),
+			admitToolResult: async () => ({ action: "allow" }),
+			admitProviderContext: async () => ({ action: "deny", reason: "generated context denied" }),
+		};
+
+		await expect(
+			captureStreamOptions("openai-completions", {}, {}, undefined, admission, { messages: [] }, () => {
+				providerCalled = true;
+			}),
+		).rejects.toThrow("generated context denied");
+		expect(providerCalled).toBe(false);
 	});
 });
