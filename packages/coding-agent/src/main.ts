@@ -556,7 +556,6 @@ async function promptForMissingSessionCwd(
 
 export interface MainOptions {
 	extensionFactories?: InlineExtension[];
-	configureModelRuntime?: (modelRuntime: ModelRuntime) => void | Promise<void>;
 	createContextAdmission?: (sessionManager: SessionManager) => ContextAdmission;
 }
 
@@ -776,7 +775,6 @@ export async function main(args: string[], options?: MainOptions) {
 			},
 		});
 		const { settingsManager, modelRuntime, resourceLoader } = services;
-		await options?.configureModelRuntime?.(modelRuntime);
 		const contextAdmission = options?.createContextAdmission?.(sessionManager);
 		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
 			...projectTrustDiagnostics,

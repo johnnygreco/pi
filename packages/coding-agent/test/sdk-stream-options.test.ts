@@ -85,6 +85,7 @@ describe("createAgentSession stream options", () => {
 		contextAdmission?: ContextAdmission,
 		context: Context = { messages: [] },
 		captureContext?: (context: Context) => void,
+		captureResult?: (result: AssistantMessage) => void,
 	): Promise<SimpleStreamOptions | undefined> {
 		const model = createModel(api);
 		const settingsManager = SettingsManager.inMemory(settings);
@@ -123,7 +124,8 @@ describe("createAgentSession stream options", () => {
 
 		try {
 			const stream = await session.agent.streamFunction(model, context, requestOptions);
-			await stream.result();
+			const result = await stream.result();
+			captureResult?.(result);
 			return capturedOptions;
 		} finally {
 			session.dispose();
@@ -176,6 +178,33 @@ describe("createAgentSession stream options", () => {
 
 		expect(options?.maxRetries).toBe(2);
 		expect(options?.maxRetryDelayMs).toBe(3000);
+	});
+
+	it("preserves the standard provider path when context admission is not configured", async () => {
+		const context: Context = {
+			messages: [{ role: "user", content: [{ type: "text", text: "standard" }], timestamp: 1 }],
+		};
+		let serializedContext: Context | undefined;
+		let result: AssistantMessage | undefined;
+
+		const options = await captureStreamOptions(
+			"openai-completions",
+			{},
+			{},
+			undefined,
+			undefined,
+			context,
+			(value) => {
+				serializedContext = value;
+			},
+			(value) => {
+				result = value;
+			},
+		);
+
+		expect(serializedContext).toBe(context);
+		expect(result?.stopReason).toBe("stop");
+		expect(options).toBeDefined();
 	});
 
 	it("runs before_provider_headers on assembled headers without forwarding the transform", async () => {
@@ -285,19 +314,32 @@ describe("createAgentSession stream options", () => {
 		expect(options?.headers?.["x-admission"]).toBe("generated-handle");
 	});
 
-	it("does not call the provider when outbound context admission denies", async () => {
+	it("reports outbound context denial as a normal provider error stream", async () => {
 		let providerCalled = false;
+		let result: AssistantMessage | undefined;
 		const admission: ContextAdmission = {
 			admitUserMessage: async () => ({ action: "allow" }),
 			admitToolResult: async () => ({ action: "allow" }),
 			admitProviderContext: async () => ({ action: "deny", reason: "generated context denied" }),
 		};
 
-		await expect(
-			captureStreamOptions("openai-completions", {}, {}, undefined, admission, { messages: [] }, () => {
+		const options = await captureStreamOptions(
+			"openai-completions",
+			{},
+			{},
+			undefined,
+			admission,
+			{ messages: [] },
+			() => {
 				providerCalled = true;
-			}),
-		).rejects.toThrow("generated context denied");
+			},
+			(value) => {
+				result = value;
+			},
+		);
+
 		expect(providerCalled).toBe(false);
+		expect(options).toBeUndefined();
+		expect(result).toMatchObject({ stopReason: "error", errorMessage: "generated context denied" });
 	});
 });

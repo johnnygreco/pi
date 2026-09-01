@@ -13,10 +13,11 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession, type ContextAdmission, ContextAdmissionDeniedError } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { InlineExtension } from "../src/core/extensions/index.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
-import { createTestResourceLoader } from "./utilities.ts";
+import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
@@ -81,6 +82,7 @@ describe("managed context admission", () => {
 		streamFn: ConstructorParameters<typeof Agent>[0]["streamFn"],
 		contextAdmission: ContextAdmission,
 		baseToolsOverride?: Record<string, AgentTool>,
+		extensionFactories?: InlineExtension[],
 	) {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		const agent = new Agent({
@@ -91,13 +93,16 @@ describe("managed context admission", () => {
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+		const extensionsResult = extensionFactories
+			? await createTestExtensionsResult(extensionFactories, tempDir)
+			: undefined;
 		session = new AgentSession({
 			agent,
 			sessionManager,
 			settingsManager: SettingsManager.create(tempDir, tempDir),
 			cwd: tempDir,
 			modelRuntime: getModelRuntime(modelRegistry),
-			resourceLoader: createTestResourceLoader(),
+			resourceLoader: createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined),
 			contextAdmission,
 			baseToolsOverride,
 			initialActiveToolNames: baseToolsOverride ? Object.keys(baseToolsOverride) : [],
@@ -128,6 +133,37 @@ describe("managed context admission", () => {
 		expect(providerInputs[0]).not.toContain("raw prompt");
 		expect(JSON.stringify(sessionManager.getEntries())).toContain("admitted prompt");
 		expect(JSON.stringify(sessionManager.getEntries())).not.toContain("raw prompt");
+	});
+
+	it("keeps standard input extensions before mandatory admission", async () => {
+		const admittedInputs: string[] = [];
+		const providerInputs: string[] = [];
+		const { session } = await createSession(
+			(_model, context) => {
+				providerInputs.push(JSON.stringify(context.messages));
+				return completedStream(assistantMessage([{ type: "text", text: "done" }]));
+			},
+			{
+				admitUserMessage: async (message) => {
+					admittedInputs.push(JSON.stringify(message.content));
+					return { action: "allow" };
+				},
+				admitToolResult: async () => ({ action: "allow" }),
+				admitProviderContext: async () => ({ action: "allow" }),
+			},
+			undefined,
+			[
+				(pi) => {
+					pi.on("input", (event) => ({ action: "transform", text: `${event.text} transformed` }));
+				},
+			],
+		);
+
+		await session.prompt("raw prompt");
+
+		expect(admittedInputs).toHaveLength(1);
+		expect(admittedInputs[0]).toContain("raw prompt transformed");
+		expect(providerInputs[0]).toContain("raw prompt transformed");
 	});
 
 	it("does not append a denied idle prompt to context or JSONL", async () => {

@@ -17,8 +17,6 @@ import type {
 	BeforeAgentStartEventResult,
 	BeforeProviderHeadersEvent,
 	BeforeProviderRequestEvent,
-	BeforeUserMessageAppendEvent,
-	BeforeUserMessageAppendEventResult,
 	CompactOptions,
 	ContextEvent,
 	ContextEventResult,
@@ -133,7 +131,6 @@ type RunnerEmitEvent = Exclude<
 	| ContextEvent
 	| BeforeProviderRequestEvent
 	| BeforeProviderHeadersEvent
-	| BeforeUserMessageAppendEvent
 	| BeforeAgentStartEvent
 	| MessageEndEvent
 	| ResourcesDiscoverEvent
@@ -1226,46 +1223,6 @@ export class ExtensionRunner {
 					this.emitError({
 						extensionPath: ext.path,
 						event: "input",
-						error: err instanceof Error ? err.message : String(err),
-						stack: err instanceof Error ? err.stack : undefined,
-					});
-				}
-			}
-		}
-		return currentText !== text || currentImages !== images
-			? { action: "transform", text: currentText, images: currentImages }
-			: { action: "continue" };
-	}
-
-	/** Emit before_user_message_append. Transforms chain, "cancel" short-circuits. */
-	async emitBeforeUserMessageAppend(
-		text: string,
-		images: ImageContent[] | undefined,
-		source: InputSource,
-	): Promise<BeforeUserMessageAppendEventResult> {
-		const ctx = this.createContext();
-		let currentText = text;
-		let currentImages = images;
-
-		for (const ext of this.extensions) {
-			for (const handler of ext.handlers.get("before_user_message_append") ?? []) {
-				try {
-					const event: BeforeUserMessageAppendEvent = {
-						type: "before_user_message_append",
-						text: currentText,
-						images: currentImages,
-						source,
-					};
-					const result = (await handler(event, ctx)) as BeforeUserMessageAppendEventResult | undefined;
-					if (result?.action === "cancel") return result;
-					if (result?.action === "transform") {
-						currentText = result.text;
-						currentImages = result.images ?? currentImages;
-					}
-				} catch (err) {
-					this.emitError({
-						extensionPath: ext.path,
-						event: "before_user_message_append",
 						error: err instanceof Error ? err.message : String(err),
 						stack: err instanceof Error ? err.stack : undefined,
 					});

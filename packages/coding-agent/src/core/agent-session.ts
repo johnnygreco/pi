@@ -1272,22 +1272,6 @@ export class AgentSession {
 				);
 			}
 
-			if (this._extensionRunner.hasHandlers("before_user_message_append")) {
-				const appendResult = await this._extensionRunner.emitBeforeUserMessageAppend(
-					expandedText,
-					currentImages,
-					options?.source ?? "interactive",
-				);
-				if (appendResult.action === "cancel") {
-					preflightResult?.(true);
-					return;
-				}
-				if (appendResult.action === "transform") {
-					expandedText = appendResult.text;
-					currentImages = appendResult.images ?? currentImages;
-				}
-			}
-
 			const admittedMessage = await this._admitUserMessage(
 				expandedText,
 				currentImages,

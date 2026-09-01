@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI, InputEvent } from "../../src/core/extensions/index.ts";
 import type { PromptTemplate } from "../../src/core/prompt-templates.ts";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
-import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
+import { createTestResourceLoader } from "../utilities.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 describe("AgentSession prompt characterization", () => {
@@ -189,88 +189,6 @@ describe("AgentSession prompt characterization", () => {
 		expect(expandedPrompt).toContain('<skill name="test" location="');
 		expect(expandedPrompt).toContain("Use the skill body.");
 		expect(expandedPrompt).toContain("explain this");
-	});
-
-	it("lets before_user_message_append replace a rendered skill prompt before it is recorded", async () => {
-		const tempDir = join(tmpdir(), `pi-skill-admission-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		mkdirSync(tempDir, { recursive: true });
-		tempDirs.push(tempDir);
-		const skillPath = join(tempDir, "test-skill.md");
-		writeFileSync(skillPath, "# Test Skill\n\nUse the skill body.");
-		let admittedPrompt = "";
-		const extensionsResult = await createTestExtensionsResult(
-			[
-				(pi) => {
-					pi.on("before_user_message_append", (event) => {
-						admittedPrompt = event.text;
-						return { action: "transform", text: "redacted" };
-					});
-				},
-			],
-			tempDir,
-		);
-		const resourceLoader = {
-			...createTestResourceLoader({ extensionsResult }),
-			getSkills: () => ({
-				skills: [
-					{
-						name: "test",
-						description: "Test skill",
-						filePath: skillPath,
-						disableModelInvocation: false,
-						baseDir: tempDir,
-						sourceInfo: createSyntheticSourceInfo(skillPath, {
-							source: "local",
-							scope: "project",
-							origin: "top-level",
-							baseDir: tempDir,
-						}),
-					},
-				],
-				diagnostics: [],
-			}),
-		};
-		const harness = await createHarness({ resourceLoader });
-		harnesses.push(harness);
-		let providerPrompt = "";
-		harness.setResponses([
-			(context) => {
-				const user = context.messages.find((message) => message.role === "user");
-				providerPrompt = user ? getMessageText(user) : "";
-				return fauxAssistantMessage("ok");
-			},
-		]);
-
-		await harness.session.prompt("/skill:test secret");
-
-		expect(admittedPrompt).toContain("Use the skill body.");
-		expect(admittedPrompt).toContain("secret");
-		expect(providerPrompt).toBe("redacted");
-		expect(getMessageText(harness.session.messages[0]!)).toBe("redacted");
-	});
-
-	it("cancels a rendered prompt before authentication, agent start, or persistence", async () => {
-		let beforeAgentStartCalls = 0;
-		const harness = await createHarness({
-			withConfiguredAuth: false,
-			extensionFactories: [
-				(pi) => {
-					pi.on("before_user_message_append", () => ({ action: "cancel" }));
-					pi.on("before_agent_start", () => {
-						beforeAgentStartCalls++;
-					});
-				},
-			],
-		});
-		harnesses.push(harness);
-
-		await harness.session.prompt("denied");
-
-		expect(harness.session.messages).toEqual([]);
-		expect(harness.sessionManager.getEntries()).toEqual([]);
-		expect(harness.getPendingResponseCount()).toBe(0);
-		expect(beforeAgentStartCalls).toBe(0);
-		expect(harness.events.some((event) => event.type === "agent_start")).toBe(false);
 	});
 
 	it("expands prompt templates before sending the prompt", async () => {
@@ -476,59 +394,6 @@ describe("AgentSession prompt characterization", () => {
 
 		releaseToolExecution?.();
 		await promptPromise;
-	});
-
-	it("admits and transforms a rendered message before queueing it", async () => {
-		let releaseToolExecution: (() => void) | undefined;
-		const toolRelease = new Promise<void>((resolve) => {
-			releaseToolExecution = resolve;
-		});
-		const admittedPrompts: string[] = [];
-		const waitTool: AgentTool = {
-			name: "wait",
-			label: "Wait",
-			description: "Wait for release",
-			parameters: Type.Object({}),
-			execute: async () => {
-				await toolRelease;
-				return { content: [{ type: "text", text: "released" }], details: {} };
-			},
-		};
-		const harness = await createHarness({
-			tools: [waitTool],
-			extensionFactories: [
-				(pi) => {
-					pi.on("before_user_message_append", (event) => {
-						admittedPrompts.push(event.text);
-						return event.text === "queued secret" ? { action: "transform", text: "queued redacted" } : undefined;
-					});
-				},
-			],
-		});
-		harnesses.push(harness);
-		harness.setResponses([
-			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("done"),
-		]);
-
-		const sawToolStart = new Promise<void>((resolve) => {
-			const unsubscribe = harness.session.subscribe((event) => {
-				if (event.type === "tool_execution_start") {
-					unsubscribe();
-					resolve();
-				}
-			});
-		});
-
-		const promptPromise = harness.session.prompt("start");
-		await sawToolStart;
-		await harness.session.prompt("queued secret", { streamingBehavior: "steer" });
-		releaseToolExecution?.();
-		await promptPromise;
-
-		expect(admittedPrompts).toEqual(["start", "queued secret"]);
-		expect(harness.session.messages.some((message) => getMessageText(message) === "queued redacted")).toBe(true);
-		expect(harness.session.messages.some((message) => getMessageText(message) === "queued secret")).toBe(false);
 	});
 
 	it("throws when prompted during streaming without a streamingBehavior", async () => {

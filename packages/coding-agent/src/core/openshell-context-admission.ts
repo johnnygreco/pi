@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
 	Context,
 	ImageContent,
@@ -8,6 +9,7 @@ import type {
 } from "@earendil-works/pi-ai";
 
 import type { ContextAdmission, ContextAdmissionResult } from "./agent-session.ts";
+import type { InputSource } from "./extensions/types.ts";
 
 const HANDLE_HEADER = "x-openshell-agent-admission-handle";
 const MAX_ADMISSION_BYTES = 4 * 1024 * 1024;
@@ -32,7 +34,7 @@ export function createOpenShellContextAdmission(
 	bridgeUrl: string,
 	getSessionId: () => string,
 	fetchRequest: typeof fetch = fetch,
-): ContextAdmission {
+) {
 	const handles = new Map<string, string>();
 
 	async function requestAdmission(
@@ -63,7 +65,10 @@ export function createOpenShellContextAdmission(
 		return parseBridgeResult(JSON.parse(new TextDecoder().decode(encoded)));
 	}
 
-	async function admitUserMessage(message: UserMessage): Promise<ContextAdmissionResult<UserMessage>> {
+	async function admitUserMessage(
+		message: UserMessage,
+		_context?: { source: InputSource },
+	): Promise<ContextAdmissionResult<UserMessage>> {
 		const envelope = userEnvelope(message);
 		if (!envelope) {
 			return { action: "deny", reason: "Image inputs are not supported by OpenShell admission" };
@@ -123,7 +128,7 @@ export function createOpenShellContextAdmission(
 			}
 			throw new Error("OpenShell admission handle is missing for the outbound context");
 		},
-	};
+	} satisfies ContextAdmission;
 }
 
 function userEnvelope(message: UserMessage): UserEnvelope | undefined {
@@ -148,7 +153,9 @@ function toolResultEnvelope(message: ToolResultMessage): ToolResultEnvelope {
 }
 
 function messageKey(message: UserMessage | ToolResultMessage): string {
-	return JSON.stringify(message.role === "user" ? userEnvelope(message) : toolResultEnvelope(message));
+	return createHash("sha256")
+		.update(JSON.stringify(message.role === "user" ? userEnvelope(message) : toolResultEnvelope(message)))
+		.digest("hex");
 }
 
 function rememberHandle(handles: Map<string, string>, key: string, handle: string): void {

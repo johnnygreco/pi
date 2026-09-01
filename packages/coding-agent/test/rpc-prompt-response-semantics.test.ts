@@ -13,12 +13,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import type { InlineExtension } from "../src/core/extensions/index.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
 import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
-import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
+import { createTestResourceLoader } from "./utilities.ts";
 
 const rpcIo = vi.hoisted(() => ({
 	outputLines: [] as string[],
@@ -96,14 +95,7 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-interface RuntimeHostOptions {
-	withAuth: boolean;
-	responseDelayMs: number;
-	model?: Model<any>;
-	extensionFactories?: InlineExtension[];
-}
-
-async function createRuntimeHost(options: RuntimeHostOptions): Promise<{
+async function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: number; model?: Model<any> }): Promise<{
 	runtimeHost: AgentSessionRuntime;
 	cleanup: () => Promise<void>;
 }> {
@@ -141,9 +133,6 @@ async function createRuntimeHost(options: RuntimeHostOptions): Promise<{
 	if (options.withAuth) {
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 	}
-	const extensionsResult = options.extensionFactories
-		? await createTestExtensionsResult(options.extensionFactories, tempDir)
-		: undefined;
 
 	const session = new AgentSession({
 		agent,
@@ -151,7 +140,7 @@ async function createRuntimeHost(options: RuntimeHostOptions): Promise<{
 		settingsManager,
 		cwd: tempDir,
 		modelRuntime: getModelRuntime(modelRegistry),
-		resourceLoader: createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined),
+		resourceLoader: createTestResourceLoader(),
 	});
 
 	const runtimeHost = {
@@ -181,7 +170,7 @@ async function createRuntimeHost(options: RuntimeHostOptions): Promise<{
 	};
 }
 
-async function startRpcMode(options: RuntimeHostOptions): Promise<{
+async function startRpcMode(options: { withAuth: boolean; responseDelayMs: number; model?: Model<any> }): Promise<{
 	lineHandler: (line: string) => void;
 	cleanup: () => Promise<void>;
 }> {
@@ -261,48 +250,19 @@ describe("RPC prompt response semantics", () => {
 		}
 	});
 
-	it("emits one success response when an extension cancels the prompt", async () => {
-		const { lineHandler, cleanup } = await startRpcMode({
-			withAuth: false,
-			responseDelayMs: 0,
-			extensionFactories: [
-				(pi) => {
-					pi.on("before_user_message_append", () => ({ action: "cancel" }));
-				},
-			],
-		});
-
-		try {
-			lineHandler(JSON.stringify({ id: "b3", type: "prompt", message: "Denied" }));
-
-			await vi.waitFor(() => {
-				const responses = getPromptResponses(rpcIo.outputLines, "b3");
-				expect(responses).toHaveLength(1);
-				expect(responses[0]).toMatchObject({
-					id: "b3",
-					type: "response",
-					command: "prompt",
-					success: true,
-				});
-			});
-		} finally {
-			await cleanup();
-		}
-	});
-
 	it("emits one success response when prompt is queued during streaming", async () => {
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 100 });
 
 		try {
-			lineHandler(JSON.stringify({ id: "b4-start", type: "prompt", message: "Start" }));
+			lineHandler(JSON.stringify({ id: "b3-start", type: "prompt", message: "Start" }));
 			await vi.waitFor(() => {
-				expect(getPromptResponses(rpcIo.outputLines, "b4-start")).toHaveLength(1);
+				expect(getPromptResponses(rpcIo.outputLines, "b3-start")).toHaveLength(1);
 			});
 
 			rpcIo.outputLines = [];
 			lineHandler(
 				JSON.stringify({
-					id: "b4",
+					id: "b3",
 					type: "prompt",
 					message: "Queue this",
 					streamingBehavior: "followUp",
@@ -310,10 +270,10 @@ describe("RPC prompt response semantics", () => {
 			);
 
 			await vi.waitFor(() => {
-				const responses = getPromptResponses(rpcIo.outputLines, "b4");
+				const responses = getPromptResponses(rpcIo.outputLines, "b3");
 				expect(responses).toHaveLength(1);
 				expect(responses[0]).toMatchObject({
-					id: "b4",
+					id: "b3",
 					type: "response",
 					command: "prompt",
 					success: true,
