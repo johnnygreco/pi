@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Added RPC `clear_queue` to retrieve and remove queued steering and follow-up messages ([#8432](https://github.com/earendil-works/pi/issues/8432)).
+
+### Fixed
+
+- Fixed extension messages sent with `triggerTurn: false` while the agent is running being inserted between a tool call and its result, which made providers that validate message order reject the replayed history. They are now appended once the turn's tool results are in ([#8537](https://github.com/earendil-works/pi/issues/8537)).
+
 ## [0.84.3] - 2026-08-24
 
 ### New Features
@@ -64,8 +74,10 @@
 - Fixed UTF-8 BOM markers preventing frontmatter and user configuration files from loading ([#8337](https://github.com/earendil-works/pi/issues/8337)).
 - Fixed invalid settings files being easy to miss during interactive startup by rendering warnings with the file path inside the TUI ([#7829](https://github.com/earendil-works/pi/issues/7829)).
 - Fixed the subagent example repeatedly prompting before running project-local agents in trusted repositories ([#8261](https://github.com/earendil-works/pi/issues/8261)).
+- Added `session_compact_failed` extension events so compaction failures and aborts expose their reason, retry state, source, and error message to handlers ([#8175](https://github.com/earendil-works/pi/issues/8175)).
+- Fixed truncated compaction and branch summaries being persisted when generation reaches its output token limit ([#7048](https://github.com/earendil-works/pi/issues/7048)).
 - Fixed npm package update checks treating older registry versions as available updates, preventing `pi update` from downgrading already-newer installed packages ([#8226](https://github.com/earendil-works/pi/issues/8226)).
-- Fixed built-in llama.cpp models disappearing from `/model` when `/llama` refreshed a configured server under `PI_OFFLINE`, and included idle-slept `sleeping` router models in the selectable catalog ([#8167](https://github.com/earendil-works/pi/issues/8167)).
+- Fixed built-in llama.cpp models disappearing from `/model` when `/llama` refreshed a configured server under `PI_OFFLINE`, and included idle-slept `sleeping` router models plus autoloadable unloaded presets in the selectable catalog ([#8167](https://github.com/earendil-works/pi/issues/8167)).
 - Fixed `pi.registerFlag()` accepting default values that do not match the declared flag type ([#8064](https://github.com/earendil-works/pi/issues/8064)).
 - Fixed Z.AI Coding Plan defaults referencing the removed GLM-5.1 model ([#8096](https://github.com/earendil-works/pi/issues/8096)).
 - Fixed repeated ambiguous truncated-response recovery being mislabeled as context overflow ([#8130](https://github.com/earendil-works/pi/issues/8130)).

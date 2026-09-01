@@ -360,6 +360,8 @@ export class AgentSession {
 	private _followUpMessages: string[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
+	/** Context-only custom messages queued during a run, flushed once the current turn's tool results are in. */
+	private _pendingCustomMessages: CustomMessage[] = [];
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -746,6 +748,15 @@ export class AgentSession {
 					this._retryAttempt = 0;
 				}
 			}
+		}
+
+		// A turn ends after its assistant message and every tool result has been appended,
+		// so this is the first point in the run where a context-only custom message can be
+		// inserted without landing between a tool call and its result. Flushing after the
+		// extension and listener dispatch above also picks up messages that turn_end
+		// handlers queued.
+		if (event.type === "turn_end") {
+			this._flushPendingCustomMessages();
 		}
 	};
 
@@ -1139,6 +1150,7 @@ export class AgentSession {
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
 			await this._emitAgentSettled();
 		}
 	}
@@ -1292,8 +1304,9 @@ export class AgentSession {
 				return;
 			}
 
-			// Flush any pending bash messages before the new prompt
+			// Flush any pending bash and custom messages before the new prompt
 			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
 
 			// Validate model
 			if (!this.model) {
@@ -1518,8 +1531,9 @@ export class AgentSession {
 	/**
 	 * Send a custom message to the session. Creates a CustomMessageEntry.
 	 *
-	 * Handles three cases:
+	 * Handles four cases:
 	 * - Streaming: queues message, processed when loop pulls from queue
+	 * - Streaming + triggerTurn false: appended to state/session once the current turn ends
 	 * - Not streaming + triggerTurn: appends to state/session, starts new turn
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 *
@@ -1550,16 +1564,40 @@ export class AgentSession {
 			}
 		} else if (options?.triggerTurn) {
 			await this._runAgentPrompt(appMessage);
+		} else if (this.isStreaming) {
+			// Appending now would put the message between an assistant tool call and its
+			// result, which providers that validate message order reject on replay. Defer
+			// to the end of the turn. Nothing is emitted yet: message events must not
+			// describe messages the session tree does not contain.
+			this._pendingCustomMessages.push(appMessage);
 		} else {
-			this.agent.state.messages.push(appMessage);
-			this.sessionManager.appendCustomMessageEntry(
-				message.customType,
-				message.content,
-				message.display,
-				message.details,
-			);
-			this._emit({ type: "message_start", message: appMessage });
-			this._emit({ type: "message_end", message: appMessage });
+			this._appendCustomMessage(appMessage);
+		}
+	}
+
+	private _appendCustomMessage(appMessage: CustomMessage): void {
+		this.agent.state.messages.push(appMessage);
+		this.sessionManager.appendCustomMessageEntry(
+			appMessage.customType,
+			appMessage.content,
+			appMessage.display,
+			appMessage.details,
+		);
+		this._emit({ type: "message_start", message: appMessage });
+		this._emit({ type: "message_end", message: appMessage });
+	}
+
+	/**
+	 * Append custom messages queued while the agent was running.
+	 * Called once the current turn's tool results are in agent state and session history.
+	 */
+	private _flushPendingCustomMessages(): void {
+		if (this._pendingCustomMessages.length === 0) return;
+
+		const pending = this._pendingCustomMessages;
+		this._pendingCustomMessages = [];
+		for (const appMessage of pending) {
+			this._appendCustomMessage(appMessage);
 		}
 	}
 
@@ -1688,6 +1726,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+			this._addPersistedDefaultToNonEmptyScope(model);
 		}
 
 		// Apply thinking level for the new model.
@@ -1696,6 +1735,20 @@ export class AgentSession {
 		this.setThinkingLevel(thinkingLevel);
 
 		await this._emitModelSelect(model, previousModel, "set");
+	}
+
+	private _addPersistedDefaultToNonEmptyScope(model: Model<any>): void {
+		if (this._scopedModels.length === 0) return;
+		if (this._scopedModels.some((scoped) => modelsAreEqual(scoped.model, model))) return;
+
+		this._scopedModels = [...this._scopedModels, { model }];
+
+		const enabledModels = this.settingsManager.getEnabledModels();
+		if (!enabledModels?.length) return;
+
+		const modelReference = `${model.provider}/${model.id}`;
+		if (enabledModels.some((pattern) => pattern.toLowerCase() === modelReference.toLowerCase())) return;
+		this.settingsManager.setEnabledModels([...enabledModels, modelReference]);
 	}
 
 	/**
@@ -1740,6 +1793,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+			this._addPersistedDefaultToNonEmptyScope(next.model);
 		}
 
 		// Apply thinking level for the new model.
@@ -1774,6 +1828,7 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
+			this._addPersistedDefaultToNonEmptyScope(nextModel);
 		}
 
 		// Apply thinking level for the new model.
