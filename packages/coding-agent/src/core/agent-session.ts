@@ -1185,19 +1185,16 @@ export class AgentSession {
 		return this.agent.hasQueuedMessages();
 	}
 
-	private async _admitUserMessage(
-		text: string,
-		images: ImageContent[] | undefined,
-		source: InputSource,
-	): Promise<UserMessage> {
+	private _createUserMessage(text: string, images?: ImageContent[]): UserMessage {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		const message: UserMessage = { role: "user", content, timestamp: Date.now() };
-		if (!this._contextAdmission) {
-			return message;
-		}
+		return { role: "user", content, timestamp: Date.now() };
+	}
+
+	private async _admitUserMessage(message: UserMessage, source: InputSource): Promise<UserMessage> {
+		if (!this._contextAdmission) return message;
 		const result = await this._contextAdmission.admitUserMessage(message, { source });
 		if (result.action === "deny") {
 			throw new ContextAdmissionDeniedError(result.reason);
@@ -1284,21 +1281,24 @@ export class AgentSession {
 				);
 			}
 
-			const admittedMessage = await this._admitUserMessage(
-				expandedText,
-				currentImages,
-				options?.source ?? "interactive",
-			);
-			const admittedParts = this._getUserMessageParts(admittedMessage);
-			expandedText = admittedParts.text;
-			currentImages = admittedParts.images;
+			let admittedMessage: UserMessage | undefined;
+			if (this._contextAdmission) {
+				admittedMessage = await this._admitUserMessage(
+					this._createUserMessage(expandedText, currentImages),
+					options?.source ?? "interactive",
+				);
+				const admittedParts = this._getUserMessageParts(admittedMessage);
+				expandedText = admittedParts.text;
+				currentImages = admittedParts.images;
+			}
 
 			// If streaming, queue the admitted message via steer() or followUp().
 			if (this.isStreaming) {
+				const queuedMessage = admittedMessage ?? this._createUserMessage(expandedText, currentImages);
 				if (streamingBehavior === "followUp") {
-					this._queueFollowUp(admittedMessage);
+					this._queueFollowUp(queuedMessage);
 				} else {
-					this._queueSteer(admittedMessage);
+					this._queueSteer(queuedMessage);
 				}
 				preflightResult?.(true);
 				return;
@@ -1338,8 +1338,8 @@ export class AgentSession {
 			// Build messages array (custom message if any, then user message)
 			messages = [];
 
-			// Add admitted user message
-			messages.push(admittedMessage);
+			// Add admitted user message, or standard Pi's message when admission is disabled.
+			messages.push(admittedMessage ?? this._createUserMessage(expandedText, currentImages));
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this._pendingNextTurnMessages) {
@@ -1468,8 +1468,12 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		const admittedMessage = await this._admitUserMessage(expandedText, images, "interactive");
-		this._queueSteer(admittedMessage);
+		const message = this._createUserMessage(expandedText, images);
+		if (!this._contextAdmission) {
+			this._queueSteer(message);
+			return;
+		}
+		this._queueSteer(await this._admitUserMessage(message, "interactive"));
 	}
 
 	/**
@@ -1489,8 +1493,12 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		const admittedMessage = await this._admitUserMessage(expandedText, images, "interactive");
-		this._queueFollowUp(admittedMessage);
+		const message = this._createUserMessage(expandedText, images);
+		if (!this._contextAdmission) {
+			this._queueFollowUp(message);
+			return;
+		}
+		this._queueFollowUp(await this._admitUserMessage(message, "interactive"));
 	}
 
 	/**
