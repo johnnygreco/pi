@@ -1,6 +1,7 @@
 // Core session management
 
 export { type Args, parseArgs } from "./cli/args.ts";
+export { type CliRuntimeOptions, runCli } from "./cli-runtime.ts";
 
 // Config paths
 export {
@@ -345,7 +346,7 @@ export {
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
 // Main entry point
-export { type MainOptions, main } from "./main.ts";
+export { type MainOptions, main, type RuntimeExtension } from "./main.ts";
 // Run modes for programmatic SDK usage
 export {
 	InteractiveMode,

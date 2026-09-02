@@ -556,7 +556,12 @@ async function promptForMissingSessionCwd(
 
 export interface MainOptions {
 	extensionFactories?: InlineExtension[];
-	createContextAdmission?: (sessionManager: SessionManager) => ContextAdmission;
+	runtimeExtension?: RuntimeExtension;
+}
+
+/** Trusted integration installed by the runtime that launches Pi. */
+export interface RuntimeExtension {
+	createContextAdmission(sessionManager: SessionManager): ContextAdmission;
 }
 
 export async function main(args: string[], options?: MainOptions) {
@@ -775,7 +780,7 @@ export async function main(args: string[], options?: MainOptions) {
 			},
 		});
 		const { settingsManager, modelRuntime, resourceLoader } = services;
-		const contextAdmission = options?.createContextAdmission?.(sessionManager);
+		const contextAdmission = options?.runtimeExtension?.createContextAdmission(sessionManager);
 		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
 			...projectTrustDiagnostics,
 			...services.diagnostics,

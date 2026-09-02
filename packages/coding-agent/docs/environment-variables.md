@@ -82,8 +82,6 @@ These variables are read by Pi itself:
 | `PI_CODING_AGENT_SESSION_DIR` | Override session storage; overridden by `--session-dir` |
 | `PI_PACKAGE_DIR` | Override the package directory, useful for Nix/Guix store paths |
 | `PI_OFFLINE` | Disable startup network operations, including update checks, package updates, and install/update telemetry |
-| `PI_OPENSHELL_CONTEXT_ADMISSION` | Set to `1` to require OpenShell context admission for every Pi session; requires `OPENSHELL_AGENT_CONVERSATION_URL` |
-| `OPENSHELL_AGENT_CONVERSATION_URL` | OpenShell sandbox-local admission bridge used when `PI_OPENSHELL_CONTEXT_ADMISSION=1` |
 | `PI_SKIP_VERSION_CHECK` | Disable the `pi.dev` latest-version request |
 | `PI_TELEMETRY` | Override install/update telemetry and provider attribution headers: `1`/`true`/`yes` or `0`/`false`/`no` |
 | `PI_CACHE_RETENTION` | Set to `long` for extended provider prompt caching where supported |
@@ -94,11 +92,3 @@ These variables are read by Pi itself:
 | `HTTP_PROXY`, `HTTPS_PROXY` | Proxy outbound HTTP requests |
 
 Provider credentials such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and cloud-provider configuration are listed in [Providers](providers.md#environment-variables-or-auth-file).
-
-### OpenShell Context Admission
-
-OpenShell admission is opt-in. When `PI_OPENSHELL_CONTEXT_ADMISSION` is absent, Pi uses its standard prompt, tool, provider, extension, and session paths without an admission bridge.
-
-When enabled, the mandatory boundary admits rendered user messages before they enter the live context or session JSONL, admits tool results before they are emitted or recorded, and attests the exact context used for each provider request. Normal extension discovery and APIs remain enabled. In particular, the standard `input` hook runs before admission, so extensions can observe or transform submitted text. Extensions are trusted in-process Pi code; OpenShell admission is not an isolation boundary between Pi and its extensions. Provider-request changes made after attestation fail closed at the OpenShell middleware.
-
-The current OpenShell admission path is text-only. User image inputs are rejected during context admission, and image-bearing tool results fail closed before provider egress.
