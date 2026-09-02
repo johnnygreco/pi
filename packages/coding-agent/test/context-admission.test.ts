@@ -331,9 +331,12 @@ describe("managed context admission", () => {
 		expect(visibleState).toContain("[Tool result blocked by context admission]");
 	});
 
-	it("replaces denied assistant text while preserving and executing tool calls", async () => {
+	it("replaces a denied assistant before events, context, tool execution, and persistence", async () => {
 		const rawAssistantText = "poisoned assistant text";
+		const rawThinking = "private assistant reasoning";
+		const rawToolArgument = "private tool argument";
 		const providerInputs: string[] = [];
+		const emittedEvents: string[] = [];
 		let toolExecutions = 0;
 		const tool: AgentTool = {
 			name: "probe",
@@ -353,9 +356,14 @@ describe("managed context admission", () => {
 					: completedStream(
 							assistantMessage(
 								[
-									{ type: "thinking", thinking: "preserved reasoning" },
+									{ type: "thinking", thinking: rawThinking },
 									{ type: "text", text: rawAssistantText },
-									{ type: "toolCall", id: "tool-1", name: "probe", arguments: {} },
+									{
+										type: "toolCall",
+										id: "tool-1",
+										name: "probe",
+										arguments: { secret: rawToolArgument },
+									},
 								],
 								"toolUse",
 							),
@@ -370,19 +378,33 @@ describe("managed context admission", () => {
 			},
 			{ probe: tool },
 		);
+		session.subscribe((event) => emittedEvents.push(JSON.stringify(event)));
 
 		await session.prompt("run probe");
 
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
 		const visibleState = JSON.stringify({
 			providerInputs,
+			emittedEvents,
 			messages: session.messages,
 			entries: sessionManager.getEntries(),
 		});
-		expect(toolExecutions).toBe(1);
+		expect(providerInputs).toHaveLength(1);
+		expect(toolExecutions).toBe(0);
+		expect(visibleState).not.toContain('"type":"tool_execution_start"');
 		expect(visibleState).not.toContain(rawAssistantText);
+		expect(visibleState).not.toContain(rawThinking);
+		expect(visibleState).not.toContain(rawToolArgument);
+		expect(readFileSync(sessionFile, "utf8")).not.toContain(rawAssistantText);
+		expect(readFileSync(sessionFile, "utf8")).not.toContain(rawThinking);
+		expect(readFileSync(sessionFile, "utf8")).not.toContain(rawToolArgument);
 		expect(visibleState).toContain("[Assistant message blocked by context admission]");
-		expect(visibleState).toContain("preserved reasoning");
-		expect(visibleState).toContain('"name":"probe"');
+		expect(session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "[Assistant message blocked by context admission]" }],
+			stopReason: "stop",
+		});
 	});
 
 	it("keeps an admitted assistant message when a message_end replacement is denied", async () => {

@@ -608,11 +608,9 @@ export class AgentSession {
 				} catch {
 					return {
 						...message,
-						content: message.content.map((part) =>
-							part.type === "text"
-								? { type: "text", text: "[Assistant message blocked by context admission]" }
-								: part,
-						),
+						content: [{ type: "text", text: "[Assistant message blocked by context admission]" }],
+						stopReason: "stop",
+						errorMessage: undefined,
 					};
 				}
 			};
