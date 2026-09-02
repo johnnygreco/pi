@@ -33,7 +33,6 @@ import type {
 	Model,
 	ProviderHeaders,
 	TextContent,
-	ToolResultMessage,
 	Usage,
 	UserMessage,
 } from "@earendil-works/pi-ai/compat";
@@ -98,7 +97,12 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
-import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
+import type {
+	BashExecutionMessage,
+	BranchSummaryMessage,
+	CompactionSummaryMessage,
+	CustomMessage,
+} from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
@@ -240,12 +244,20 @@ export type ProviderContextAdmissionResult =
 	| { action: "allow"; context?: Context }
 	| { action: "deny"; reason?: string };
 
+export type MessageOrigin =
+	| "user"
+	| "tool_result"
+	| "assistant"
+	| "compaction_summary"
+	| "branch_summary"
+	| "extension_message"
+	| "bash_execution";
+
 export interface ContextAdmission {
-	admitUserMessage(
-		message: UserMessage,
-		context: { source: InputSource },
-	): Promise<ContextAdmissionResult<UserMessage>>;
-	admitToolResult(message: ToolResultMessage): Promise<ContextAdmissionResult<ToolResultMessage>>;
+	admitMessage<T extends AgentMessage>(
+		message: T,
+		context: { origin: MessageOrigin; source?: InputSource },
+	): Promise<ContextAdmissionResult<T>>;
 	/** Admit the exact context immediately before any provider request is serialized. */
 	admitProviderContext(context: Context): Promise<ProviderContextAdmissionResult>;
 	/** Transform headers for the exact context of the outbound provider request. */
@@ -574,13 +586,9 @@ export class AgentSession {
 		};
 
 		if (this._contextAdmission) {
-			const contextAdmission = this._contextAdmission;
 			this.agent.beforeToolResultAppend = async (message) => {
 				try {
-					const result = await contextAdmission.admitToolResult(message);
-					if (result.action === "allow") {
-						return result.message ?? message;
-					}
+					return await this._admitAppend(message, "tool_result");
 				} catch {
 					// Admission failures are denied below.
 				}
@@ -593,6 +601,20 @@ export class AgentSession {
 					isError: true,
 					timestamp: message.timestamp,
 				};
+			};
+			this.agent.beforeAssistantMessageAppend = async (message) => {
+				try {
+					return await this._admitAppend(message, "assistant");
+				} catch {
+					return {
+						...message,
+						content: message.content.map((part) =>
+							part.type === "text"
+								? { type: "text", text: "[Assistant message blocked by context admission]" }
+								: part,
+						),
+					};
+				}
 			};
 		}
 	}
@@ -1193,13 +1215,30 @@ export class AgentSession {
 		return { role: "user", content, timestamp: Date.now() };
 	}
 
-	private async _admitUserMessage(message: UserMessage, source: InputSource): Promise<UserMessage> {
+	private async _admitAppend<T extends AgentMessage>(
+		message: T,
+		origin: MessageOrigin,
+		source?: InputSource,
+	): Promise<T> {
 		if (!this._contextAdmission) return message;
-		const result = await this._contextAdmission.admitUserMessage(message, { source });
+		const result = await this._contextAdmission.admitMessage(message, source ? { origin, source } : { origin });
 		if (result.action === "deny") {
 			throw new ContextAdmissionDeniedError(result.reason);
 		}
 		return result.message ?? message;
+	}
+
+	private async _admitCompactionSummary(summary: string, tokensBefore: number): Promise<string> {
+		const message = await this._admitAppend(
+			{
+				role: "compactionSummary",
+				summary,
+				tokensBefore,
+				timestamp: Date.now(),
+			} satisfies CompactionSummaryMessage,
+			"compaction_summary",
+		);
+		return message.summary;
 	}
 
 	private _getUserMessageParts(message: UserMessage): { text: string; images?: ImageContent[] } {
@@ -1283,8 +1322,9 @@ export class AgentSession {
 
 			let admittedMessage: UserMessage | undefined;
 			if (this._contextAdmission) {
-				admittedMessage = await this._admitUserMessage(
+				admittedMessage = await this._admitAppend(
 					this._createUserMessage(expandedText, currentImages),
+					"user",
 					options?.source ?? "interactive",
 				);
 				const admittedParts = this._getUserMessageParts(admittedMessage);
@@ -1357,15 +1397,20 @@ export class AgentSession {
 			// Add all custom messages from extensions
 			if (result?.messages) {
 				for (const msg of result.messages) {
-					messages.push({
-						role: "custom",
-						customType: msg.customType,
-						// Untyped extensions can pass null/missing content; normalize at ingestion.
-						content: msg.content ?? [],
-						display: msg.display,
-						details: msg.details,
-						timestamp: Date.now(),
-					});
+					messages.push(
+						await this._admitAppend(
+							{
+								role: "custom",
+								customType: msg.customType,
+								// Untyped extensions can pass null/missing content; normalize at ingestion.
+								content: msg.content ?? [],
+								display: msg.display,
+								details: msg.details,
+								timestamp: Date.now(),
+							} satisfies CustomMessage,
+							"extension_message",
+						),
+					);
 				}
 			}
 			// Apply extension-modified system prompt, or reset to base
@@ -1473,7 +1518,7 @@ export class AgentSession {
 			this._queueSteer(message);
 			return;
 		}
-		this._queueSteer(await this._admitUserMessage(message, "interactive"));
+		this._queueSteer(await this._admitAppend(message, "user", "interactive"));
 	}
 
 	/**
@@ -1498,7 +1543,7 @@ export class AgentSession {
 			this._queueFollowUp(message);
 			return;
 		}
-		this._queueFollowUp(await this._admitUserMessage(message, "interactive"));
+		this._queueFollowUp(await this._admitAppend(message, "user", "interactive"));
 	}
 
 	/**
@@ -1553,15 +1598,18 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
-		const appMessage = {
-			role: "custom" as const,
-			customType: message.customType,
-			// Untyped extensions can pass null/missing content; normalize at ingestion.
-			content: message.content ?? [],
-			display: message.display,
-			details: message.details,
-			timestamp: Date.now(),
-		} satisfies CustomMessage<T>;
+		const appMessage = await this._admitAppend(
+			{
+				role: "custom" as const,
+				customType: message.customType,
+				// Untyped extensions can pass null/missing content; normalize at ingestion.
+				content: message.content ?? [],
+				display: message.display,
+				details: message.details,
+				timestamp: Date.now(),
+			} satisfies CustomMessage<T>,
+			"extension_message",
+		);
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
@@ -2091,6 +2139,7 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
+			summary = await this._admitCompactionSummary(summary, tokensBefore);
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
@@ -2416,6 +2465,7 @@ export class AgentSession {
 				return false;
 			}
 
+			summary = await this._admitCompactionSummary(summary, tokensBefore);
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
@@ -3069,7 +3119,7 @@ export class AgentSession {
 				},
 			);
 
-			this.recordBashResult(command, result, options);
+			await this.recordBashResult(command, result, options);
 			return result;
 		} finally {
 			this._bashAbortControllers.delete(abortController);
@@ -3080,18 +3130,25 @@ export class AgentSession {
 	 * Record a bash execution result in session history.
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
-	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
-		const bashMessage: BashExecutionMessage = {
-			role: "bashExecution",
-			command,
-			output: result.output,
-			exitCode: result.exitCode,
-			cancelled: result.cancelled,
-			truncated: result.truncated,
-			fullOutputPath: result.fullOutputPath,
-			timestamp: Date.now(),
-			excludeFromContext: options?.excludeFromContext,
-		};
+	async recordBashResult(
+		command: string,
+		result: BashResult,
+		options?: { excludeFromContext?: boolean },
+	): Promise<void> {
+		const bashMessage = await this._admitAppend(
+			{
+				role: "bashExecution",
+				command,
+				output: result.output,
+				exitCode: result.exitCode,
+				cancelled: result.cancelled,
+				truncated: result.truncated,
+				fullOutputPath: result.fullOutputPath,
+				timestamp: Date.now(),
+				excludeFromContext: options?.excludeFromContext,
+			} satisfies BashExecutionMessage,
+			"bash_execution",
+		);
 
 		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
 		if (this.isStreaming) {
@@ -3316,6 +3373,16 @@ export class AgentSession {
 			// Summary is attached at the navigation target position (newLeafId), not the old branch
 			let summaryEntry: BranchSummaryEntry | undefined;
 			if (summaryText) {
+				const admittedSummary = await this._admitAppend(
+					{
+						role: "branchSummary",
+						summary: summaryText,
+						fromId: oldLeafId ?? "root",
+						timestamp: Date.now(),
+					} satisfies BranchSummaryMessage,
+					"branch_summary",
+				);
+				summaryText = admittedSummary.summary;
 				// Create summary at target position (can be null for root)
 				const summaryId = this.sessionManager.branchWithSummary(
 					newLeafId,

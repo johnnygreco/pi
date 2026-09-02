@@ -296,6 +296,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * The returned message replaces the finalized result in full.
 	 */
 	beforeToolResultAppend?: (message: ToolResultMessage, signal?: AbortSignal) => Promise<ToolResultMessage>;
+
+	/**
+	 * Called after an assistant message is finalized, before it is emitted or appended to context.
+	 * The returned message replaces the finalized message in full.
+	 */
+	beforeAssistantMessageAppend?: (message: AssistantMessage, signal?: AbortSignal) => Promise<AssistantMessage>;
 }
 
 /**

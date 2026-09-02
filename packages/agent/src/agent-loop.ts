@@ -345,7 +345,7 @@ async function streamAssistantResponse(
 
 			case "done":
 			case "error": {
-				const finalMessage = await response.result();
+				const finalMessage = await prepareAssistantMessage(await response.result(), config, signal);
 				if (addedPartial) {
 					context.messages[context.messages.length - 1] = finalMessage;
 				} else {
@@ -360,7 +360,7 @@ async function streamAssistantResponse(
 		}
 	}
 
-	const finalMessage = await response.result();
+	const finalMessage = await prepareAssistantMessage(await response.result(), config, signal);
 	if (addedPartial) {
 		context.messages[context.messages.length - 1] = finalMessage;
 	} else {
@@ -369,6 +369,14 @@ async function streamAssistantResponse(
 	}
 	await emit({ type: "message_end", message: finalMessage });
 	return finalMessage;
+}
+
+async function prepareAssistantMessage(
+	message: AssistantMessage,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+): Promise<AssistantMessage> {
+	return config.beforeAssistantMessageAppend ? await config.beforeAssistantMessageAppend(message, signal) : message;
 }
 
 /**

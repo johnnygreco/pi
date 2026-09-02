@@ -246,11 +246,12 @@ describe("createAgentSession stream options", () => {
 		const handles = new Map<string, string>();
 		let nextHandle = "handle-first";
 		const admission: ContextAdmission = {
-			admitUserMessage: async (message) => {
-				handles.set(JSON.stringify(message.content), nextHandle);
+			admitMessage: async (message) => {
+				if ("content" in message) {
+					handles.set(JSON.stringify(message.content), nextHandle);
+				}
 				return { action: "allow" };
 			},
-			admitToolResult: async () => ({ action: "allow" }),
 			admitProviderContext: async () => ({ action: "allow" }),
 			transformProviderHeaders: async (headers, context) => {
 				let candidate: (typeof context.messages)[number] | undefined;
@@ -266,9 +267,9 @@ describe("createAgentSession stream options", () => {
 			},
 		};
 
-		await admission.admitUserMessage(firstMessage, { source: "interactive" });
+		await admission.admitMessage(firstMessage, { origin: "user", source: "interactive" });
 		nextHandle = "handle-queued";
-		await admission.admitUserMessage(queuedMessage, { source: "interactive" });
+		await admission.admitMessage(queuedMessage, { origin: "user", source: "interactive" });
 
 		const options = await captureStreamOptions("openai-completions", {}, {}, undefined, admission, {
 			messages: [firstMessage],
@@ -286,8 +287,7 @@ describe("createAgentSession stream options", () => {
 		};
 		let serializedContext: Context | undefined;
 		const admission: ContextAdmission = {
-			admitUserMessage: async () => ({ action: "allow" }),
-			admitToolResult: async () => ({ action: "allow" }),
+			admitMessage: async () => ({ action: "allow" }),
 			admitProviderContext: async (context) => {
 				expect(context).toBe(generated);
 				return { action: "allow", context: admitted };
@@ -318,8 +318,7 @@ describe("createAgentSession stream options", () => {
 		let providerCalled = false;
 		let result: AssistantMessage | undefined;
 		const admission: ContextAdmission = {
-			admitUserMessage: async () => ({ action: "allow" }),
-			admitToolResult: async () => ({ action: "allow" }),
+			admitMessage: async () => ({ action: "allow" }),
 			admitProviderContext: async () => ({ action: "deny", reason: "generated context denied" }),
 		};
 

@@ -6557,7 +6557,11 @@ export class InteractiveMode {
 			);
 
 			// Record the result in session
-			this.session.recordBashResult(command, result, { excludeFromContext });
+			try {
+				await this.session.recordBashResult(command, result, { excludeFromContext });
+			} catch (error) {
+				this.showSubmissionError(error, "Bash command failed");
+			}
 			this.bashComponent = undefined;
 			this.ui.requestRender();
 			return;
@@ -6601,7 +6605,7 @@ export class InteractiveMode {
 			if (this.bashComponent) {
 				this.bashComponent.setComplete(undefined, false);
 			}
-			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+			this.showSubmissionError(error, "Bash command failed");
 		}
 
 		this.bashComponent = undefined;

@@ -298,6 +298,44 @@ describe("Agent", () => {
 		expect(receivedSignal?.aborted).toBe(true);
 	});
 
+	it.each(["terminal event", "stream end"] as const)(
+		"applies beforeAssistantMessageAppend before context mutation on %s",
+		async (finalization) => {
+			const order: string[] = [];
+			const agent = new Agent({
+				streamFn: () => {
+					const stream = new MockAssistantStream();
+					queueMicrotask(() => {
+						const message = createAssistantMessage("raw");
+						if (finalization === "terminal event") {
+							stream.push({ type: "done", reason: "stop", message });
+						} else {
+							stream.end(message);
+						}
+					});
+					return stream;
+				},
+				beforeAssistantMessageAppend: async (message) => {
+					order.push("hook");
+					return { ...message, content: [{ type: "text", text: "admitted" }] };
+				},
+			});
+			agent.subscribe((event) => {
+				if (event.type === "message_end" && event.message.role === "assistant") {
+					order.push("message_end");
+				}
+			});
+
+			await agent.prompt("hello");
+
+			expect(order).toEqual(["hook", "message_end"]);
+			expect(agent.state.messages.at(-1)).toMatchObject({
+				role: "assistant",
+				content: [{ type: "text", text: "admitted" }],
+			});
+		},
+	);
+
 	it("should ignore tool updates after the tool execution settles", async () => {
 		const toolSchema = Type.Object({});
 		let delayedUpdate: AgentToolUpdateCallback<{ status: string }> | undefined;

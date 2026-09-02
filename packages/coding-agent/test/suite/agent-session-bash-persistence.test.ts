@@ -41,7 +41,7 @@ describe("AgentSession bash and persistence characterization", () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 
-		harness.session.recordBashResult("echo hi", {
+		await harness.session.recordBashResult("echo hi", {
 			output: "hi",
 			exitCode: 0,
 			cancelled: false,
@@ -90,7 +90,7 @@ describe("AgentSession bash and persistence characterization", () => {
 
 		const firstPrompt = harness.session.prompt("start");
 		await sawToolStart;
-		harness.session.recordBashResult("echo hi", {
+		await harness.session.recordBashResult("echo hi", {
 			output: "hi",
 			exitCode: 0,
 			cancelled: false,
@@ -249,7 +249,7 @@ describe("AgentSession bash and persistence characterization", () => {
 			}
 		});
 
-		harness.session.recordBashResult("echo hi", {
+		await harness.session.recordBashResult("echo hi", {
 			output: "hi",
 			exitCode: 0,
 			cancelled: false,

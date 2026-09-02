@@ -21,6 +21,7 @@ export {
 	type ContextAdmission,
 	ContextAdmissionDeniedError,
 	type ContextAdmissionResult,
+	type MessageOrigin,
 	type ModelCycleResult,
 	type ParsedSkillBlock,
 	type PromptOptions,

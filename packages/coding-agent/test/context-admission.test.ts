@@ -118,11 +118,10 @@ describe("managed context admission", () => {
 				return completedStream(assistantMessage([{ type: "text", text: "done" }]));
 			},
 			{
-				admitUserMessage: async (message) => ({
+				admitMessage: async (message) => ({
 					action: "allow",
 					message: { ...message, content: [{ type: "text", text: "admitted prompt" }] },
 				}),
-				admitToolResult: async () => ({ action: "allow" }),
 				admitProviderContext: async () => ({ action: "allow" }),
 			},
 		);
@@ -137,6 +136,7 @@ describe("managed context admission", () => {
 
 	it("keeps standard input extensions before mandatory admission", async () => {
 		const admittedInputs: string[] = [];
+		const admittedOrigins: string[] = [];
 		const providerInputs: string[] = [];
 		const { session } = await createSession(
 			(_model, context) => {
@@ -144,17 +144,20 @@ describe("managed context admission", () => {
 				return completedStream(assistantMessage([{ type: "text", text: "done" }]));
 			},
 			{
-				admitUserMessage: async (message) => {
-					admittedInputs.push(JSON.stringify(message.content));
+				admitMessage: async (message, { origin }) => {
+					admittedOrigins.push(origin);
+					if (origin === "user") admittedInputs.push(JSON.stringify(message));
 					return { action: "allow" };
 				},
-				admitToolResult: async () => ({ action: "allow" }),
 				admitProviderContext: async () => ({ action: "allow" }),
 			},
 			undefined,
 			[
 				(pi) => {
 					pi.on("input", (event) => ({ action: "transform", text: `${event.text} transformed` }));
+					pi.on("before_agent_start", () => ({
+						message: { customType: "context", content: "extension context", display: false },
+					}));
 				},
 			],
 		);
@@ -163,6 +166,7 @@ describe("managed context admission", () => {
 
 		expect(admittedInputs).toHaveLength(1);
 		expect(admittedInputs[0]).toContain("raw prompt transformed");
+		expect(admittedOrigins).toContain("extension_message");
 		expect(providerInputs[0]).toContain("raw prompt transformed");
 	});
 
@@ -174,11 +178,10 @@ describe("managed context admission", () => {
 				return completedStream(assistantMessage([{ type: "text", text: "done" }]));
 			},
 			{
-				admitUserMessage: async (message) =>
+				admitMessage: async (message) =>
 					JSON.stringify(message).includes("denied")
 						? { action: "deny", reason: "test policy" }
 						: { action: "allow" },
-				admitToolResult: async () => ({ action: "allow" }),
 				admitProviderContext: async () => ({ action: "allow" }),
 			},
 		);
@@ -212,9 +215,8 @@ describe("managed context admission", () => {
 				return stream;
 			},
 			{
-				admitUserMessage: async (message) =>
+				admitMessage: async (message) =>
 					JSON.stringify(message).includes("denied") ? { action: "deny" } : { action: "allow" },
-				admitToolResult: async () => ({ action: "allow" }),
 				admitProviderContext: async () => ({ action: "allow" }),
 			},
 		);
@@ -257,14 +259,13 @@ describe("managed context admission", () => {
 					return stream;
 				},
 				{
-					admitUserMessage: async (message) =>
+					admitMessage: async (message) =>
 						JSON.stringify(message).includes("raw queued")
 							? {
 									action: "allow",
 									message: { ...message, content: [{ type: "text", text: "admitted queued" }] },
 								}
 							: { action: "allow" },
-					admitToolResult: async () => ({ action: "allow" }),
 					admitProviderContext: async () => ({ action: "allow" }),
 				},
 			);
@@ -305,8 +306,8 @@ describe("managed context admission", () => {
 						);
 			},
 			{
-				admitUserMessage: async () => ({ action: "allow" }),
-				admitToolResult: async () => ({ action: "deny" }),
+				admitMessage: async (_message, { origin }) =>
+					origin === "tool_result" ? { action: "deny" } : { action: "allow" },
 				admitProviderContext: async () => ({ action: "allow" }),
 			},
 			{ probe: tool },
@@ -330,6 +331,235 @@ describe("managed context admission", () => {
 		expect(visibleState).toContain("[Tool result blocked by context admission]");
 	});
 
+	it("replaces denied assistant text while preserving and executing tool calls", async () => {
+		const rawAssistantText = "poisoned assistant text";
+		const providerInputs: string[] = [];
+		let toolExecutions = 0;
+		const tool: AgentTool = {
+			name: "probe",
+			label: "probe",
+			description: "probe",
+			parameters: Type.Object({}),
+			execute: async () => {
+				toolExecutions++;
+				return { content: [{ type: "text", text: "safe result" }], details: {} };
+			},
+		};
+		const { session, sessionManager } = await createSession(
+			(_model, context) => {
+				providerInputs.push(JSON.stringify(context.messages));
+				return context.messages.some((message) => message.role === "toolResult")
+					? completedStream(assistantMessage([{ type: "text", text: "done" }]))
+					: completedStream(
+							assistantMessage(
+								[
+									{ type: "thinking", thinking: "preserved reasoning" },
+									{ type: "text", text: rawAssistantText },
+									{ type: "toolCall", id: "tool-1", name: "probe", arguments: {} },
+								],
+								"toolUse",
+							),
+						);
+			},
+			{
+				admitMessage: async (message, { origin }) =>
+					origin === "assistant" && JSON.stringify(message).includes(rawAssistantText)
+						? { action: "deny" }
+						: { action: "allow" },
+				admitProviderContext: async () => ({ action: "allow" }),
+			},
+			{ probe: tool },
+		);
+
+		await session.prompt("run probe");
+
+		const visibleState = JSON.stringify({
+			providerInputs,
+			messages: session.messages,
+			entries: sessionManager.getEntries(),
+		});
+		expect(toolExecutions).toBe(1);
+		expect(visibleState).not.toContain(rawAssistantText);
+		expect(visibleState).toContain("[Assistant message blocked by context admission]");
+		expect(visibleState).toContain("preserved reasoning");
+		expect(visibleState).toContain('"name":"probe"');
+	});
+
+	it("admits extension messages before every delivery mode queues or appends them", async () => {
+		let releaseFirstResponse: (() => void) | undefined;
+		let providerCalls = 0;
+		const { session, sessionManager } = await createSession(
+			() => {
+				providerCalls++;
+				if (providerCalls > 1) {
+					return completedStream(assistantMessage([{ type: "text", text: "done" }]));
+				}
+				const stream = new MockAssistantStream();
+				releaseFirstResponse = () => {
+					const message = assistantMessage([{ type: "text", text: "first done" }]);
+					stream.push({ type: "start", partial: { ...message, content: [] } });
+					stream.push({ type: "done", reason: "stop", message });
+				};
+				return stream;
+			},
+			{
+				admitMessage: async (message, { origin }) =>
+					origin === "extension_message" && message.role === "custom"
+						? { action: "allow", message: { ...message, content: "admitted extension" } }
+						: { action: "allow" },
+				admitProviderContext: async () => ({ action: "allow" }),
+			},
+		);
+
+		const firstPrompt = session.prompt("start");
+		while (!releaseFirstResponse) await new Promise((resolve) => setTimeout(resolve, 0));
+		await session.sendCustomMessage({ customType: "a", content: "raw steer", display: false });
+		await session.sendCustomMessage(
+			{ customType: "b", content: "raw follow-up", display: false },
+			{ deliverAs: "followUp" },
+		);
+		await session.sendCustomMessage(
+			{ customType: "c", content: "raw deferred", display: false },
+			{ triggerTurn: false },
+		);
+		await session.sendCustomMessage(
+			{ customType: "d", content: "raw next turn", display: false },
+			{ deliverAs: "nextTurn" },
+		);
+		releaseFirstResponse();
+		await firstPrompt;
+		await session.prompt("flush next turn");
+
+		const visibleState = JSON.stringify({ messages: session.messages, entries: sessionManager.getEntries() });
+		expect(visibleState).not.toContain("raw steer");
+		expect(visibleState).not.toContain("raw follow-up");
+		expect(visibleState).not.toContain("raw deferred");
+		expect(visibleState).not.toContain("raw next turn");
+		expect(visibleState.match(/admitted extension/g)).toHaveLength(8);
+	});
+
+	it("admits immediate and deferred bash results before context and persistence", async () => {
+		let releaseResponse: (() => void) | undefined;
+		const { session, sessionManager } = await createSession(
+			() => {
+				const stream = new MockAssistantStream();
+				releaseResponse = () => {
+					const message = assistantMessage([{ type: "text", text: "done" }]);
+					stream.push({ type: "done", reason: "stop", message });
+				};
+				return stream;
+			},
+			{
+				admitMessage: async (message, { origin }) =>
+					origin === "bash_execution" && message.role === "bashExecution"
+						? { action: "allow", message: { ...message, output: "admitted bash output" } }
+						: { action: "allow" },
+				admitProviderContext: async () => ({ action: "allow" }),
+			},
+		);
+
+		await session.recordBashResult("idle", {
+			output: "raw idle output",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+		});
+		const prompt = session.prompt("start");
+		while (!releaseResponse) await new Promise((resolve) => setTimeout(resolve, 0));
+		await session.recordBashResult("deferred", {
+			output: "raw deferred output",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+		});
+		expect(session.hasPendingBashMessages).toBe(true);
+		releaseResponse();
+		await prompt;
+
+		const visibleState = JSON.stringify({ messages: session.messages, entries: sessionManager.getEntries() });
+		expect(visibleState).not.toContain("raw idle output");
+		expect(visibleState).not.toContain("raw deferred output");
+		expect(visibleState.match(/admitted bash output/g)).toHaveLength(4);
+	});
+
+	it("aborts compaction without appending a denied summary", async () => {
+		const { session, sessionManager } = await createSession(
+			() => completedStream(assistantMessage([{ type: "text", text: "unused" }])),
+			{
+				admitMessage: async (_message, { origin }) =>
+					origin === "compaction_summary" ? { action: "deny", reason: "summary denied" } : { action: "allow" },
+				admitProviderContext: async () => ({ action: "allow" }),
+			},
+			undefined,
+			[
+				(pi) => {
+					pi.on("session_before_compact", (event) => ({
+						compaction: {
+							summary: "raw compaction summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+				},
+			],
+		);
+		session.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+		const now = Date.now();
+		sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "message to compact" }],
+			timestamp: now - 1000,
+		});
+		sessionManager.appendMessage(assistantMessage([{ type: "text", text: "assistant response to compact" }]));
+		session.agent.state.messages = sessionManager.buildSessionContext().messages;
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		const beforeCompaction = readFileSync(sessionFile, "utf8");
+
+		await expect(session.compact()).rejects.toThrow("summary denied");
+
+		expect(readFileSync(sessionFile, "utf8")).toBe(beforeCompaction);
+		expect(sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
+	});
+
+	it("persists an admitted replacement for an extension-provided branch summary", async () => {
+		const { session, sessionManager } = await createSession(
+			() => completedStream(assistantMessage([{ type: "text", text: "unused" }])),
+			{
+				admitMessage: async (message, { origin }) =>
+					origin === "branch_summary" && message.role === "branchSummary"
+						? { action: "allow", message: { ...message, summary: "admitted branch summary" } }
+						: { action: "allow" },
+				admitProviderContext: async () => ({ action: "allow" }),
+			},
+			undefined,
+			[
+				(pi) => {
+					pi.on("session_before_tree", () => ({ summary: { summary: "raw branch summary" } }));
+				},
+			],
+		);
+		const targetId = sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "target" }],
+			timestamp: Date.now() - 2000,
+		});
+		sessionManager.appendMessage(assistantMessage([{ type: "text", text: "target response" }]));
+		sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "abandoned" }],
+			timestamp: Date.now() - 1000,
+		});
+		sessionManager.appendMessage(assistantMessage([{ type: "text", text: "abandoned response" }]));
+		session.agent.state.messages = sessionManager.buildSessionContext().messages;
+
+		await session.navigateTree(targetId, { summarize: true });
+
+		const visibleState = JSON.stringify({ messages: session.messages, entries: sessionManager.getEntries() });
+		expect(visibleState).toContain("admitted branch summary");
+		expect(visibleState).not.toContain("raw branch summary");
+	});
+
 	it("fails closed when user admission throws", async () => {
 		let providerCalls = 0;
 		const { session, sessionManager } = await createSession(
@@ -338,10 +568,10 @@ describe("managed context admission", () => {
 				return completedStream(assistantMessage([{ type: "text", text: "done" }]));
 			},
 			{
-				admitUserMessage: async () => {
+				admitMessage: async (_message, { origin }) => {
+					if (origin !== "user") return { action: "allow" };
 					throw new Error("admission unavailable");
 				},
-				admitToolResult: async () => ({ action: "allow" }),
 				admitProviderContext: async () => ({ action: "allow" }),
 			},
 		);

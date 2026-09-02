@@ -202,10 +202,10 @@ await runCli(process.argv.slice(2), {
 });
 ```
 
-`ContextAdmission` exposes three mandatory decision points:
+`ContextAdmission` exposes two mandatory decision points:
 
-- rendered user messages before they enter live context or session storage
-- finalized tool results before they enter live context or session storage
+- each supported history append before it enters live context or session
+  storage, identified by a generic `MessageOrigin`
 - the exact context immediately before each provider request is serialized
 
 It can also transform the outbound headers for the admitted provider context.
