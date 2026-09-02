@@ -43,6 +43,8 @@ import type {
 	MessageEndEvent,
 	MessageEndEventResult,
 	MessageRenderer,
+	ModelRequestAdmissionEvent,
+	ModelRequestAdmissionResult,
 	ProjectTrustContext,
 	ProjectTrustEvent,
 	ProjectTrustEventResult,
@@ -64,6 +66,8 @@ import type {
 	ToolResultEventResult,
 	UserBashEvent,
 	UserBashEventResult,
+	UserMessageAdmissionEvent,
+	UserMessageAdmissionResult,
 } from "./types.ts";
 
 // Extension shortcuts compete with canonical keybinding ids from keybindings.json.
@@ -132,6 +136,8 @@ type RunnerEmitEvent = Exclude<
 	| BeforeProviderRequestEvent
 	| BeforeProviderHeadersEvent
 	| BeforeAgentStartEvent
+	| UserMessageAdmissionEvent
+	| ModelRequestAdmissionEvent
 	| MessageEndEvent
 	| ResourcesDiscoverEvent
 	| InputEvent
@@ -574,6 +580,34 @@ export class ExtensionRunner {
 			}
 		}
 		return false;
+	}
+
+	private getRequiredHandler(
+		eventType: "user_message_admission" | "model_request_admission",
+	): (...args: unknown[]) => Promise<unknown> {
+		const handlers = this.extensions.flatMap((extension) => extension.handlers.get(eventType) ?? []);
+		if (handlers.length !== 1) {
+			throw new Error(`Managed admission requires exactly one ${eventType} handler; found ${handlers.length}`);
+		}
+		return handlers[0];
+	}
+
+	assertManagedAdmissionHandlers(): void {
+		this.getRequiredHandler("user_message_admission");
+		this.getRequiredHandler("model_request_admission");
+		if (this.hasHandlers("before_provider_request")) {
+			throw new Error("Managed admission is incompatible with before_provider_request handlers");
+		}
+	}
+
+	async emitUserMessageAdmission(event: UserMessageAdmissionEvent): Promise<UserMessageAdmissionResult> {
+		const result = await this.getRequiredHandler("user_message_admission")(event, this.createContext());
+		return result as UserMessageAdmissionResult;
+	}
+
+	async emitModelRequestAdmission(event: ModelRequestAdmissionEvent): Promise<ModelRequestAdmissionResult> {
+		const result = await this.getRequiredHandler("model_request_admission")(event, this.createContext());
+		return result as ModelRequestAdmissionResult;
 	}
 
 	getMessageRenderer(customType: string): MessageRenderer | undefined {

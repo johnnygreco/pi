@@ -32,6 +32,7 @@ import type {
 	TextContent,
 	ToolResultMessage,
 	Usage,
+	UserMessage,
 } from "@earendil-works/pi-ai";
 import type {
 	AutocompleteItem,
@@ -708,6 +709,56 @@ export interface BeforeAgentStartEvent {
 	systemPromptOptions: BuildSystemPromptOptions;
 }
 
+export type PiRequestKind = "compaction" | "agentInitial" | "agentContinuation" | "retry";
+
+export interface PiProspectiveMessageV1 {
+	role: "system" | "developer" | "user" | "assistant" | "tool" | "custom";
+	content: string | null;
+	providerRole?: "system" | "developer" | "user" | "assistant";
+	name?: string;
+	toolCallId?: string;
+	toolCalls: Array<{ id: string; name: string; arguments: string }>;
+}
+
+export interface PiProspectiveRequestV1 {
+	schemaVersion: "pi.prospective-request.v1";
+	model: { provider: string; id: string; api: string };
+	systemPrompt: string;
+	messages: PiProspectiveMessageV1[];
+	tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
+	toolChoice: { mode: "auto" | "none" | "required" | "function"; functionName?: string };
+	generation: { temperature: number; maxTokens: number };
+	candidateIndex?: number;
+	requestKind: PiRequestKind;
+}
+
+export interface UserMessageAdmissionEvent {
+	type: "user_message_admission";
+	message: UserMessage;
+	prospectiveRequest: PiProspectiveRequestV1;
+	candidateIndex: number;
+	source: InputSource;
+	delivery: "immediate" | "steer" | "followUp";
+}
+
+export type UserMessageAdmissionResult =
+	| { action: "allow" }
+	| { action: "replace"; message: UserMessage }
+	| { action: "deny"; reasonCode: string };
+
+export interface ModelRequestAdmissionEvent {
+	type: "model_request_admission";
+	modelRequestId: string;
+	requestKind: PiRequestKind;
+	request: PiProspectiveRequestV1;
+	signal?: AbortSignal;
+}
+
+export type ModelRequestAdmissionResult =
+	| { action: "allow"; receipt: Uint8Array }
+	| { action: "replace"; systemPrompt: string; receipt: Uint8Array }
+	| { action: "deny"; reasonCode: string };
+
 /** Fired when an agent loop starts */
 export interface AgentStartEvent {
 	type: "agent_start";
@@ -1040,6 +1091,8 @@ export type ExtensionEvent =
 	| BeforeProviderHeadersEvent
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
+	| UserMessageAdmissionEvent
+	| ModelRequestAdmissionEvent
 	| AgentStartEvent
 	| AgentEndEvent
 	| AgentSettledEvent
@@ -1225,6 +1278,14 @@ export interface ExtensionAPI {
 	on(event: "before_provider_headers", handler: ExtensionHandler<BeforeProviderHeadersEvent>): void;
 	on(event: "after_provider_response", handler: ExtensionHandler<AfterProviderResponseEvent>): void;
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
+	on(
+		event: "user_message_admission",
+		handler: ExtensionHandler<UserMessageAdmissionEvent, UserMessageAdmissionResult>,
+	): void;
+	on(
+		event: "model_request_admission",
+		handler: ExtensionHandler<ModelRequestAdmissionEvent, ModelRequestAdmissionResult>,
+	): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
 	on(event: "agent_settled", handler: ExtensionHandler<AgentSettledEvent>): void;

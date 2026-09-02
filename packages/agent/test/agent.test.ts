@@ -82,6 +82,141 @@ function createDeferred(): {
 }
 
 describe("Agent", () => {
+	it("prepares the initial LLM context before emitting or committing the prompt", async () => {
+		const events: AgentEvent[] = [];
+		let streamCalls = 0;
+		const denied = new Error("denied");
+		const agent = new Agent({
+			prepareContext: (context) => {
+				expect(context.messages.at(-1)?.role).toBe("user");
+				expect(agent.state.messages).toEqual([]);
+				expect(events).toEqual([]);
+				throw denied;
+			},
+			streamFn: () => {
+				streamCalls++;
+				return new MockAssistantStream();
+			},
+		});
+		agent.subscribe((event) => {
+			events.push(event);
+		});
+
+		await expect(agent.prompt("blocked")).rejects.toBe(denied);
+		expect(agent.state.messages).toEqual([]);
+		expect(streamCalls).toBe(0);
+	});
+
+	it("does not commit a prompt when context preparation finishes after cancellation", async () => {
+		const preparationStarted = createDeferred();
+		const releasePreparation = createDeferred();
+		const events: AgentEvent[] = [];
+		let streamCalls = 0;
+		const agent = new Agent({
+			prepareContext: async (context) => {
+				preparationStarted.resolve();
+				await releasePreparation.promise;
+				return context;
+			},
+			streamFn: () => {
+				streamCalls++;
+				return new MockAssistantStream();
+			},
+		});
+		agent.subscribe((event) => {
+			events.push(event);
+		});
+
+		const prompt = agent.prompt("cancelled");
+		await preparationStarted.promise;
+		agent.abort();
+		releasePreparation.resolve();
+
+		await expect(prompt).rejects.toMatchObject({ name: "AbortError" });
+		expect(agent.state.messages).toEqual([]);
+		expect(events).toEqual([]);
+		expect(streamCalls).toBe(0);
+	});
+
+	it("balances lifecycle events when continuation preparation fails", async () => {
+		const events: AgentEvent[] = [];
+		let preparationCalls = 0;
+		const denied = new Error("continuation denied");
+		const tool: AgentTool = {
+			name: "fixture",
+			label: "fixture",
+			description: "fixture",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "result" }], details: {} }),
+		};
+		const agent = new Agent({
+			initialState: { tools: [tool] },
+			prepareContext: (context) => {
+				preparationCalls++;
+				if (preparationCalls === 2) throw denied;
+				return context;
+			},
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message = createAssistantToolUseMessage([
+						{ type: "toolCall", id: "call-1", name: "fixture", arguments: {} },
+					]);
+					stream.push({ type: "done", reason: "toolUse", message });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe((event) => {
+			events.push(event);
+		});
+
+		await expect(agent.prompt("run tool")).rejects.toBe(denied);
+		expect(events.filter((event) => event.type === "agent_start")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "agent_end")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "turn_start")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "turn_end")).toHaveLength(1);
+		expect(agent.state.messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult"]);
+	});
+
+	it("does not commit a queued prompt when its context preparation fails", async () => {
+		const streamStarted = createDeferred();
+		const releaseStream = createDeferred();
+		const events: AgentEvent[] = [];
+		let preparationCalls = 0;
+		const denied = new Error("queued request denied");
+		const agent = new Agent({
+			prepareContext: (context) => {
+				preparationCalls++;
+				if (preparationCalls === 2) throw denied;
+				return context;
+			},
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				streamStarted.resolve();
+				void releaseStream.promise.then(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe((event) => {
+			events.push(event);
+		});
+
+		const prompt = agent.prompt("initial");
+		await streamStarted.promise;
+		agent.followUp({ role: "user", content: "queued", timestamp: Date.now() });
+		releaseStream.resolve();
+
+		await expect(prompt).rejects.toBe(denied);
+		expect(events.filter((event) => event.type === "agent_start")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "agent_end")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "turn_start")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "turn_end")).toHaveLength(1);
+		expect(agent.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+	});
+
 	it("uses the configured default when a legacy caller omits streamFn", async () => {
 		let calls = 0;
 		setDefaultStreamFn(() => {

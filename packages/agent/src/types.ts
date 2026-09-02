@@ -31,6 +31,9 @@ export type StreamFn = (
 	options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
+/** Inspect or replace the final LLM context immediately before a provider request. */
+export type PrepareContext = (context: Context, signal?: AbortSignal) => Promise<Context> | Context;
+
 /**
  * Configuration for how tool calls from a single assistant message are executed.
  *
@@ -148,6 +151,7 @@ export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
+	prepareContext?: PrepareContext;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.

@@ -21,6 +21,7 @@ import type {
 	AgentTool,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
+	PrepareContext,
 	PrepareNextTurnContext,
 	QueueMode,
 	ShouldStopAfterTurnContext,
@@ -113,6 +114,7 @@ export interface AgentOptions {
 		context: PrepareNextTurnContext,
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
+	prepareContext?: PrepareContext;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
 	sessionId?: string;
@@ -162,6 +164,8 @@ type ActiveRun = {
 	promise: Promise<void>;
 	resolve: () => void;
 	abortController: AbortController;
+	agentStarted: boolean;
+	agentEnded: boolean;
 };
 
 /**
@@ -201,6 +205,7 @@ export class Agent {
 		context: PrepareNextTurnContext,
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
+	public prepareContext?: PrepareContext;
 	private activeRun?: ActiveRun;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
@@ -228,6 +233,7 @@ export class Agent {
 		this.shouldStopAfterTurn = runtimeOptions.shouldStopAfterTurn;
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
 		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
+		this.prepareContext = runtimeOptions.prepareContext;
 		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
 		this.followUpQueue = new PendingMessageQueue(runtimeOptions.followUpMode ?? "one-at-a-time");
 		this.sessionId = runtimeOptions.sessionId;
@@ -469,6 +475,7 @@ export class Agent {
 							return await this.prepareNextTurn?.(this.signal);
 						}
 					: undefined,
+			prepareContext: this.prepareContext,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,
@@ -493,7 +500,13 @@ export class Agent {
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
 		});
-		this.activeRun = { promise, resolve: resolvePromise, abortController };
+		this.activeRun = {
+			promise,
+			resolve: resolvePromise,
+			abortController,
+			agentStarted: false,
+			agentEnded: false,
+		};
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
@@ -502,6 +515,9 @@ export class Agent {
 		try {
 			await executor(abortController.signal);
 		} catch (error) {
+			if (this.prepareContext && (!this.activeRun.agentStarted || this.activeRun.agentEnded)) {
+				throw error;
+			}
 			await this.handleRunFailure(error, abortController.signal.aborted);
 		} finally {
 			this.finishRun();
@@ -542,6 +558,8 @@ export class Agent {
 	 * and `finishRun()` clears runtime-owned state.
 	 */
 	private async processEvents(event: AgentEvent): Promise<void> {
+		if (event.type === "agent_start" && this.activeRun) this.activeRun.agentStarted = true;
+		if (event.type === "agent_end" && this.activeRun) this.activeRun.agentEnded = true;
 		switch (event.type) {
 			case "message_start":
 				this._state.streamingMessage = event.message;

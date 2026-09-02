@@ -592,6 +592,7 @@ Available built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`
 |--------|-------------|
 | `-e`, `--extension <source>` | Load extension from path, npm, or git (repeatable) |
 | `--no-extensions` | Disable extension discovery |
+| `--managed-admission` | Require one fail-closed admission extension (supervised runtimes) |
 | `--skill <path>` | Load skill (repeatable) |
 | `--no-skills` | Disable skill discovery |
 | `--prompt-template <path>` | Load prompt template (repeatable) |

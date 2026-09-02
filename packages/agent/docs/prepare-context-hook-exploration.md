@@ -1,0 +1,3 @@
+# Prepare-context hook exploration
+
+This branch archives the August 2026 managed-admission prototype based on Pi v0.84.1 (`53fa77cc`): it adds a generic agent-core `prepareContext` callback, then layers OpenShell-specific admission events, request receipts, fail-closed session behavior, and focused tests across `pi-ai`, `pi-agent-core`, and `pi-coding-agent`. The design was preserved for reference rather than continued because the generic hook is useful prior art but the supervising-runtime policy and transport contract create too much Pi-specific surface area; the active design instead keeps Pi hooks general-purpose and implements OpenShell admission in an extension.

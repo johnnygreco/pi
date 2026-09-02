@@ -675,6 +675,20 @@ pi.on("before_provider_headers", (event, ctx) => {
 
 Runs once per provider request; retries reuse the same headers rather than re-firing the hook.
 
+#### Managed admission
+
+`--managed-admission` is an opt-in integration mode for a supervising runtime. It requires exactly one
+`user_message_admission` handler and one `model_request_admission` handler. User admission runs before the
+submitted message is persisted or emitted and may allow, deny, or replace that message. Model admission runs on
+the final converted context before every provider request and must return a receipt when it allows the request.
+
+Managed mode fails closed when either handler is missing, duplicated, throws, or returns an invalid result. It
+also rejects `before_provider_request` handlers because they could change the serialized payload after admission.
+`before_provider_headers` remains supported; Pi adds the reserved receipt header after those handlers run.
+
+Provider-internal retries are disabled in managed mode. Pi's explicit agent and summarization retries each run
+model admission again and receive a new request ID and receipt.
+
 #### before_provider_request
 
 Fired after the provider-specific payload is built, right before the request is sent. Handlers run in extension load order. Returning `undefined` keeps the payload unchanged. Returning any other value replaces the payload for later handlers and for the actual request.

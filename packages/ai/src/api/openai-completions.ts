@@ -1043,6 +1043,25 @@ function addCacheControlToTextContent(
 	return false;
 }
 
+/** Apply the exact history replay normalization used by Chat Completions. */
+export function normalizeOpenAICompletionsMessages(model: Model<"openai-completions">, messages: Message[]): Message[] {
+	const normalizeToolCallId = (id: string): string => {
+		if (id.includes("|")) {
+			const separatorIndex = id.indexOf("|");
+			const callId = id.slice(0, separatorIndex).replace(/[^a-zA-Z0-9_-]/g, "_");
+			const itemId = id.slice(separatorIndex + 1).replace(/[^a-zA-Z0-9_-]/g, "_");
+			const combinedId = itemId.length > 0 ? `${callId}_${itemId}` : callId;
+			if (combinedId.length <= 40) return combinedId;
+			const hash = shortHash(id).slice(0, 8);
+			const prefix = callId.slice(0, Math.max(1, 40 - hash.length - 1));
+			return `${prefix}_${hash}`;
+		}
+		if (model.provider === "openai") return id.length > 40 ? id.slice(0, 40) : id;
+		return id;
+	};
+	return transformMessages(messages, model, (id) => normalizeToolCallId(id));
+}
+
 export function convertMessages(
 	model: Model<"openai-completions">,
 	context: Context,
@@ -1051,33 +1070,7 @@ export function convertMessages(
 ): ChatCompletionMessageParam[] {
 	const params: ChatCompletionMessageParam[] = [];
 
-	const normalizeToolCallId = (id: string): string => {
-		// Handle pipe-separated IDs from OpenAI Responses API
-		// Format: {call_id}|{id} where {id} can be 400+ chars with special chars (+, /, =)
-		// These come from providers like github-copilot, openai-codex, opencode
-		// Extract just the call_id part and normalize it
-		// Multiple tool calls in the same turn can share call_id but differ by item_id.
-		// Preserve item-level uniqueness when replaying into Chat Completions, which
-		// requires distinct tool call ids.
-		if (id.includes("|")) {
-			// Sanitize to allowed chars and truncate to 40 chars (OpenAI limit)
-			const separatorIndex = id.indexOf("|");
-			const callId = id.slice(0, separatorIndex).replace(/[^a-zA-Z0-9_-]/g, "_");
-			const itemId = id.slice(separatorIndex + 1).replace(/[^a-zA-Z0-9_-]/g, "_");
-			const combinedId = itemId.length > 0 ? `${callId}_${itemId}` : callId;
-			if (combinedId.length <= 40) {
-				return combinedId;
-			}
-			const hash = shortHash(id).slice(0, 8);
-			const prefix = callId.slice(0, Math.max(1, 40 - hash.length - 1));
-			return `${prefix}_${hash}`;
-		}
-
-		if (model.provider === "openai") return id.length > 40 ? id.slice(0, 40) : id;
-		return id;
-	};
-
-	const transformedMessages = transformMessages(context.messages, model, (id) => normalizeToolCallId(id));
+	const transformedMessages = normalizeOpenAICompletionsMessages(model, context.messages);
 
 	if (context.systemPrompt) {
 		const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;

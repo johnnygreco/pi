@@ -22,6 +22,7 @@ import type {
 	AgentState,
 	AgentTool,
 	PrepareNextTurnContext,
+	StreamFn,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
@@ -33,6 +34,7 @@ import type {
 	ProviderHeaders,
 	TextContent,
 	Usage,
+	UserMessage,
 } from "@earendil-works/pi-ai/compat";
 import {
 	clampThinkingLevel,
@@ -51,6 +53,12 @@ import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
+import {
+	applyUserResult,
+	buildProspectiveRequest,
+	ManagedAdmissionError,
+	type ManagedAdmissionSessionState,
+} from "./admission.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
@@ -91,6 +99,7 @@ import {
 	type TreePreparation,
 	type TurnEndEvent,
 	type TurnStartEvent,
+	type UserMessageAdmissionResult,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
@@ -225,6 +234,12 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Whether OpenShell admission handlers are mandatory for this session. */
+	managedAdmission?: boolean;
+	/** Internal state shared with the managed request preparation hook. */
+	managedAdmissionState?: ManagedAdmissionSessionState;
+	/** Managed wrapper used only for compaction requests. */
+	managedCompactionStream?: StreamFn;
 }
 
 export interface ExtensionBindings {
@@ -353,6 +368,9 @@ export class AgentSession {
 	private _excludedToolNames?: Set<string>;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
+	private readonly _managedAdmission: boolean;
+	private readonly _managedAdmissionState?: ManagedAdmissionSessionState;
+	private readonly _managedCompactionStream?: StreamFn;
 	private _extensionUIContext?: ExtensionUIContext;
 	private _extensionMode: ExtensionMode = "print";
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
@@ -389,6 +407,9 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._managedAdmission = config.managedAdmission ?? false;
+		this._managedAdmissionState = config.managedAdmissionState;
+		this._managedCompactionStream = config.managedCompactionStream;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -1117,6 +1138,11 @@ export class AgentSession {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
+		let managedPendingBash: BashExecutionMessage[] | undefined;
+		let managedPendingNextTurn: CustomMessage[] | undefined;
+		let managedSystemPrompt: string | undefined;
+		let managedSystemPromptOverride: string | undefined;
+		let managedPreflightAccepted = false;
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
@@ -1162,25 +1188,55 @@ export class AgentSession {
 				expandedText = this._expandSkillCommand(expandedText);
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
+			if (this.isStreaming && !options?.streamingBehavior) {
+				throw new Error(
+					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+				);
+			}
+
+			const candidateContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
+			if (currentImages) candidateContent.push(...currentImages);
+			let candidate: UserMessage = {
+				role: "user",
+				content: candidateContent,
+				timestamp: Date.now(),
+			};
+			if (this._managedAdmission) {
+				candidate = await this._admitUserMessage(
+					candidate,
+					options?.source ?? "interactive",
+					this.isStreaming ? (options?.streamingBehavior ?? "steer") : "immediate",
+				);
+				const firstCandidatePart = typeof candidate.content === "string" ? undefined : candidate.content[0];
+				expandedText =
+					typeof candidate.content === "string"
+						? candidate.content
+						: firstCandidatePart?.type === "text"
+							? firstCandidatePart.text
+							: "";
+			}
 
 			// If streaming, queue via steer() or followUp() based on option
 			if (this.isStreaming) {
-				if (!options?.streamingBehavior) {
-					throw new Error(
-						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
-					);
-				}
-				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+				if (options?.streamingBehavior === "followUp") {
+					await this._queueFollowUpMessage(candidate);
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					await this._queueSteerMessage(candidate);
 				}
 				preflightResult?.(true);
 				return;
 			}
 
-			// Flush any pending bash messages before the new prompt
-			this._flushPendingBashMessages();
+			// In managed mode these messages remain speculative until the complete
+			// provider request has passed model admission.
+			if (this._managedAdmission) {
+				managedPendingBash = this._pendingBashMessages.slice();
+				managedPendingNextTurn = this._pendingNextTurnMessages.slice();
+				managedSystemPrompt = this.agent.state.systemPrompt;
+				managedSystemPromptOverride = this._systemPromptOverride;
+			} else {
+				this._flushPendingBashMessages();
+			}
 
 			// Validate model
 			if (!this.model) {
@@ -1205,29 +1261,19 @@ export class AgentSession {
 			// Check if we need to compact before sending (catches aborted responses).
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
-			if (lastAssistant) {
+			if (lastAssistant && !this._managedAdmission) {
 				await this._checkCompaction(lastAssistant, false);
 			}
 
-			// Build messages array (custom message if any, then user message)
-			messages = [];
-
-			// Add user message
-			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
-			if (currentImages) {
-				userContent.push(...currentImages);
-			}
-			messages.push({
-				role: "user",
-				content: userContent,
-				timestamp: Date.now(),
-			});
+			// Preserve the model-visible order without committing managed pending
+			// messages before the final admission decision.
+			messages = [...(managedPendingBash ?? []), candidate];
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this._pendingNextTurnMessages) {
 				messages.push(msg);
 			}
-			this._pendingNextTurnMessages = [];
+			if (!this._managedAdmission) this._pendingNextTurnMessages = [];
 
 			// Emit before_agent_start extension event
 			const result = await this._extensionRunner.emitBeforeAgentStart(
@@ -1268,8 +1314,79 @@ export class AgentSession {
 			return;
 		}
 
-		preflightResult?.(true);
-		await this._runAgentPrompt(messages);
+		if (this._managedAdmission) {
+			this._pendingBashMessages = [];
+			this._pendingNextTurnMessages = [];
+			if (!this._managedAdmissionState) throw new ManagedAdmissionError("admission_unavailable");
+			this._managedAdmissionState.onRequestAdmitted = () => {
+				managedPreflightAccepted = true;
+				preflightResult?.(true);
+			};
+		}
+		if (!this._managedAdmission) preflightResult?.(true);
+		try {
+			await this._runAgentPrompt(messages);
+		} catch (error) {
+			if (this._managedAdmission) {
+				if (this._managedAdmissionState) this._managedAdmissionState.onRequestAdmitted = undefined;
+				if (!managedPreflightAccepted) preflightResult?.(false);
+				if (!managedPreflightAccepted && error instanceof ManagedAdmissionError) {
+					this._pendingBashMessages = managedPendingBash ?? [];
+					this._pendingNextTurnMessages = managedPendingNextTurn ?? [];
+					this._systemPromptOverride = managedSystemPromptOverride;
+					this.agent.state.systemPrompt = managedSystemPrompt ?? this._baseSystemPrompt;
+				} else if (error instanceof ManagedAdmissionError) {
+					this.agent.clearAllQueues();
+					this._steeringMessages = [];
+					this._followUpMessages = [];
+					this._emitQueueUpdate();
+				}
+			}
+			throw error;
+		}
+		if (this._managedAdmissionState) this._managedAdmissionState.onRequestAdmitted = undefined;
+	}
+
+	private async _admitUserMessage(
+		message: UserMessage,
+		source: InputSource,
+		delivery: "immediate" | "steer" | "followUp",
+	): Promise<UserMessage> {
+		const model = this.model;
+		if (!model) throw new Error(formatNoModelSelectedMessage());
+		const prospectiveMessages = await this.agent.convertToLlm([...this.agent.state.messages, message]);
+		const candidateIndex = prospectiveMessages.length - 1;
+		if (prospectiveMessages[candidateIndex]?.role !== "user") {
+			throw new ManagedAdmissionError("candidate_not_model_visible");
+		}
+		const prospectiveRequest = buildProspectiveRequest(
+			model,
+			{
+				systemPrompt: this._baseSystemPrompt,
+				messages: prospectiveMessages,
+				tools: this.agent.state.tools,
+			},
+			"agentInitial",
+			candidateIndex,
+		);
+		const prospectiveCandidateIndex = prospectiveRequest.candidateIndex;
+		if (prospectiveCandidateIndex === undefined) {
+			throw new ManagedAdmissionError("candidate_not_model_visible");
+		}
+		let result: UserMessageAdmissionResult;
+		try {
+			result = await this._extensionRunner.emitUserMessageAdmission({
+				type: "user_message_admission",
+				message,
+				prospectiveRequest,
+				candidateIndex: prospectiveCandidateIndex,
+				source,
+				delivery,
+			});
+		} catch {
+			throw new ManagedAdmissionError("admission_unavailable");
+		}
+		return applyUserResult(message, result);
 	}
 
 	/**
@@ -1341,15 +1458,13 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
-		// Check for extension commands (cannot be queued)
-		if (text.startsWith("/")) {
-			this._throwIfExtensionCommand(text);
+		if (this._managedAdmission) {
+			await this.prompt(text, { images, streamingBehavior: "steer" });
+			return;
 		}
-
-		// Expand skill commands and prompt templates
+		if (text.startsWith("/")) this._throwIfExtensionCommand(text);
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-
 		await this._queueSteer(expandedText, images);
 	}
 
@@ -1361,61 +1476,50 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async followUp(text: string, images?: ImageContent[]): Promise<void> {
-		// Check for extension commands (cannot be queued)
-		if (text.startsWith("/")) {
-			this._throwIfExtensionCommand(text);
+		if (this._managedAdmission) {
+			await this.prompt(text, { images, streamingBehavior: "followUp" });
+			return;
 		}
-
-		// Expand skill commands and prompt templates
+		if (text.startsWith("/")) this._throwIfExtensionCommand(text);
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-
 		await this._queueFollowUp(expandedText, images);
 	}
 
-	/**
-	 * Internal: Queue a steering message (already expanded, no extension command check).
-	 */
 	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
+		if (images) content.push(...images);
+		await this._queueSteerMessage({ role: "user", content, timestamp: Date.now() });
+	}
+
+	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
+		if (images) content.push(...images);
+		await this._queueFollowUpMessage({ role: "user", content, timestamp: Date.now() });
+	}
+
+	private async _queueSteerMessage(message: UserMessage): Promise<void> {
+		const firstPart = typeof message.content === "string" ? undefined : message.content[0];
+		const text =
+			typeof message.content === "string" ? message.content : firstPart?.type === "text" ? firstPart.text : "";
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
-		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		this.agent.steer(message);
 	}
 
-	/**
-	 * Internal: Queue a follow-up message (already expanded, no extension command check).
-	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUpMessage(message: UserMessage): Promise<void> {
+		const firstPart = typeof message.content === "string" ? undefined : message.content[0];
+		const text =
+			typeof message.content === "string" ? message.content : firstPart?.type === "text" ? firstPart.text : "";
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
-		}
-		this.agent.followUp({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		this.agent.followUp(message);
 	}
 
-	/**
-	 * Throw an error if the text is an extension command.
-	 */
 	private _throwIfExtensionCommand(text: string): void {
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		const command = this._extensionRunner.getCommand(commandName);
-
-		if (command) {
+		if (this._extensionRunner.getCommand(commandName)) {
 			throw new Error(
 				`Extension command "/${commandName}" cannot be queued. Use prompt() or execute the command when not streaming.`,
 			);
@@ -1859,7 +1963,7 @@ export class AgentSession {
 					customInstructions,
 					this._compactionAbortController.signal,
 					this.thinkingLevel,
-					this.agent.streamFunction,
+					this._managedCompactionStream ?? this.agent.streamFunction,
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
@@ -2131,7 +2235,7 @@ export class AgentSession {
 					undefined,
 					this._autoCompactionAbortController.signal,
 					this.thinkingLevel,
-					this.agent.streamFunction,
+					this._managedCompactionStream ?? this.agent.streamFunction,
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason }),
@@ -2594,6 +2698,9 @@ export class AgentSession {
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;
 		}
+		if (this._managedAdmission) {
+			this._extensionRunner.assertManagedAdmissionHandlers();
+		}
 		this._bindExtensionCore(this._extensionRunner);
 		this._applyExtensionBindings(this._extensionRunner);
 
@@ -2732,6 +2839,7 @@ export class AgentSession {
 			this._retryAbortController = undefined;
 		}
 
+		if (this._managedAdmissionState) this._managedAdmissionState.nextRequestKind = "retry";
 		return true;
 	}
 
@@ -3003,7 +3111,7 @@ export class AgentSession {
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
-					streamFn: this.agent.streamFunction,
+					streamFn: this._managedCompactionStream ?? this.agent.streamFunction,
 					retry: this.settingsManager.getRetrySettings(),
 					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
 				});

@@ -2,6 +2,12 @@ import { describe, expect, test } from "vitest";
 import { parseArgs } from "../src/cli/args.ts";
 
 describe("parseArgs", () => {
+	test("parses managed admission as a built-in flag", () => {
+		const result = parseArgs(["--managed-admission"]);
+		expect(result.managedAdmission).toBe(true);
+		expect(result.unknownFlags.size).toBe(0);
+	});
+
 	describe("--version flag", () => {
 		test("parses --version flag", () => {
 			const result = parseArgs(["--version"]);

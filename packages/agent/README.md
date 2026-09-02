@@ -55,12 +55,13 @@ LLMs only understand `user`, `assistant`, and `toolResult`. The `convertToLlm` f
 ### Message Flow
 
 ```
-AgentMessage[] → transformContext() → AgentMessage[] → convertToLlm() → Message[] → LLM
-                    (optional)                           (required)
+AgentMessage[] → transformContext() → AgentMessage[] → convertToLlm() → Context → prepareContext() → LLM
+                    (optional)                           (required)                 (optional)
 ```
 
 1. **transformContext**: Prune old messages, inject external context
 2. **convertToLlm**: Filter out UI-only messages, convert custom types to LLM format
+3. **prepareContext**: Inspect or replace the final provider-neutral context immediately before streaming
 
 ## Event Flow
 
@@ -191,6 +192,9 @@ const agent = new Agent({
 
   // Transform context before convertToLlm (for pruning, compaction)
   transformContext: async (messages, signal) => pruneOldMessages(messages),
+
+  // Inspect or replace the final LLM Context before each provider request
+  prepareContext: async (context, signal) => context,
 
   // Steering mode: "one-at-a-time" (default) or "all"
   steeringMode: "one-at-a-time",

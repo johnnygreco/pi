@@ -100,20 +100,22 @@ export async function runAgentLoop(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): Promise<AgentMessage[]> {
-	const newMessages: AgentMessage[] = [...prompts];
+	const initialMessages = [...prompts, ...((await config.getSteeringMessages?.()) || [])];
+	const newMessages: AgentMessage[] = [...initialMessages];
 	const currentContext: AgentContext = {
 		...context,
-		messages: [...context.messages, ...prompts],
+		messages: [...context.messages, ...initialMessages],
 	};
+	const preparedContext = await prepareAssistantContext(currentContext, config, signal);
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
-	for (const prompt of prompts) {
+	for (const prompt of initialMessages) {
 		await emit({ type: "message_start", message: prompt });
 		await emit({ type: "message_end", message: prompt });
 	}
 
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn(), preparedContext);
 	return newMessages;
 }
 
@@ -132,13 +134,22 @@ export async function runAgentLoopContinue(
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
-	const newMessages: AgentMessage[] = [];
-	const currentContext: AgentContext = { ...context };
+	const initialMessages = (await config.getSteeringMessages?.()) || [];
+	const newMessages: AgentMessage[] = [...initialMessages];
+	const currentContext: AgentContext = {
+		...context,
+		messages: [...context.messages, ...initialMessages],
+	};
+	const preparedContext = await prepareAssistantContext(currentContext, config, signal);
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
+	for (const message of initialMessages) {
+		await emit({ type: "message_start", message });
+		await emit({ type: "message_end", message });
+	}
 
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn(), preparedContext);
 	return newMessages;
 }
 
@@ -159,12 +170,13 @@ async function runLoop(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
+	initialPreparedContext: Context,
 ): Promise<void> {
 	let currentContext = initialContext;
 	let config = initialConfig;
 	let firstTurn = true;
-	// Check for steering messages at start (user may have typed while waiting)
-	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+	let pendingMessages: AgentMessage[] = [];
+	let preparedContext: Context | undefined = initialPreparedContext;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -172,6 +184,18 @@ async function runLoop(
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			if (!preparedContext) {
+				const requestContext =
+					pendingMessages.length === 0
+						? currentContext
+						: { ...currentContext, messages: [...currentContext.messages, ...pendingMessages] };
+				try {
+					preparedContext = await prepareAssistantContext(requestContext, config, signal);
+				} catch (error) {
+					await emit({ type: "agent_end", messages: newMessages });
+					throw error;
+				}
+			}
 			if (!firstTurn) {
 				await emit({ type: "turn_start" });
 			} else {
@@ -190,7 +214,15 @@ async function runLoop(
 			}
 
 			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
+			const message = await streamAssistantResponse(
+				currentContext,
+				preparedContext,
+				config,
+				signal,
+				emit,
+				streamFunction,
+			);
+			preparedContext = undefined;
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -280,28 +312,12 @@ async function runLoop(
  */
 async function streamAssistantResponse(
 	context: AgentContext,
+	llmContext: Context,
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
 ): Promise<AssistantMessage> {
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
-	let messages = context.messages;
-	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
-	}
-
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
-
-	// Build LLM context
-	const llmContext: Context = {
-		systemPrompt: context.systemPrompt,
-		messages: llmMessages,
-		tools: context.tools,
-	};
-
-	// Resolve API key (important for expiring tokens)
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
 
@@ -369,6 +385,31 @@ async function streamAssistantResponse(
 	}
 	await emit({ type: "message_end", message: finalMessage });
 	return finalMessage;
+}
+
+async function prepareAssistantContext(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+): Promise<Context> {
+	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
+	let messages = context.messages;
+	if (config.transformContext) {
+		messages = await config.transformContext(messages, signal);
+	}
+
+	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
+	const llmMessages = await config.convertToLlm(messages);
+
+	// Build LLM context
+	const llmContext: Context = {
+		systemPrompt: context.systemPrompt,
+		messages: llmMessages,
+		tools: context.tools,
+	};
+	const preparedContext = config.prepareContext ? await config.prepareContext(llmContext, signal) : llmContext;
+	if (signal?.aborted) throw signal.reason ?? new Error("Operation aborted");
+	return preparedContext;
 }
 
 /**

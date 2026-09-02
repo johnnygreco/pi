@@ -63,6 +63,10 @@ const { session } = await createAgentSession({
 });
 ```
 
+Set `managedAdmission: true` only when the resource loader supplies exactly one `user_message_admission` handler
+and one `model_request_admission` handler. Managed sessions fail closed and reject `before_provider_request`
+handlers so the admitted request cannot be rewritten before transport.
+
 ### AgentSession
 
 The session manages agent lifecycle, message history, model state, compaction, and event streaming.

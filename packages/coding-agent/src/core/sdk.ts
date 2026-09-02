@@ -1,8 +1,21 @@
+import { Buffer } from "node:buffer";
 import { join } from "node:path";
-import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
+import {
+	Agent,
+	type AgentMessage,
+	type StreamFn,
+	setDefaultStreamFn,
+	type ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
+import { type Context, clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
+import {
+	type AdmittedRequest,
+	admitModelContext,
+	ManagedAdmissionError,
+	type ManagedAdmissionSessionState,
+} from "./admission.ts";
 import { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
@@ -82,6 +95,8 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Require one fail-closed OpenShell admission authority for user submissions and every model request. */
+	managedAdmission?: boolean;
 }
 
 /** Result from createAgentSession */
@@ -290,6 +305,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
+	const managedAdmissionState: ManagedAdmissionSessionState | undefined = options.managedAdmission ? {} : undefined;
+	const admittedRequests = new WeakMap<Context, AdmittedRequest>();
 
 	agent = new Agent({
 		initialState: {
@@ -299,32 +316,68 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			tools: [],
 		},
 		convertToLlm: convertToLlmWithBlockImages,
-		streamFn: async (model, context, options) => {
+		prepareContext: options.managedAdmission
+			? async (requestContext, signal) => {
+					const runner = extensionRunnerRef.current;
+					if (!runner || !managedAdmissionState) {
+						throw new ManagedAdmissionError("admission_unavailable");
+					}
+					const requestKind =
+						managedAdmissionState.nextRequestKind ??
+						(requestContext.messages.at(-1)?.role === "user" ? "agentInitial" : "agentContinuation");
+					managedAdmissionState.nextRequestKind = undefined;
+					const admitted = await admitModelContext(runner, agent.state.model, requestContext, requestKind, signal);
+					admittedRequests.set(admitted.context, admitted);
+					const onRequestAdmitted = managedAdmissionState.onRequestAdmitted;
+					managedAdmissionState.onRequestAdmitted = undefined;
+					onRequestAdmitted?.();
+					return admitted.context;
+				}
+			: undefined,
+		streamFn: async (requestModel, requestContext, requestOptions) => {
+			const admitted = admittedRequests.get(requestContext);
+			if (options.managedAdmission && !admitted) throw new ManagedAdmissionError("admission_unavailable");
+			admittedRequests.delete(requestContext);
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
 			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 			// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
 			// Use max int32 to effectively disable the timeout.
 			const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
-			const timeoutMs = options?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
+			const timeoutMs = requestOptions?.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs;
 			const websocketConnectTimeoutMs =
-				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
+				requestOptions?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const headerRunner = extensionRunnerRef.current;
-			return modelRuntime.streamSimple(model, context, {
-				...options,
+			return modelRuntime.streamSimple(requestModel, requestContext, {
+				...requestOptions,
+				...(admitted
+					? {
+							temperature: admitted.temperature,
+							maxTokens: admitted.maxTokens,
+							toolChoice: admitted.toolChoice,
+						}
+					: {}),
 				timeoutMs,
 				websocketConnectTimeoutMs,
-				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+				maxRetries: admitted ? 0 : (requestOptions?.maxRetries ?? providerRetrySettings.maxRetries),
+				maxRetryDelayMs: requestOptions?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
 				transformHeaders: async (requestHeaders) => {
-					const headers = mergeProviderAttributionHeaders(
-						model,
+					const attributedHeaders = mergeProviderAttributionHeaders(
+						requestModel,
 						settingsManager,
-						options?.sessionId,
+						requestOptions?.sessionId,
 						requestHeaders,
 					);
-					return headerRunner?.hasHandlers("before_provider_headers")
-						? headerRunner.emitBeforeProviderHeaders(headers ?? {})
-						: (headers ?? {});
+					const headers = headerRunner?.hasHandlers("before_provider_headers")
+						? await headerRunner.emitBeforeProviderHeaders(attributedHeaders ?? {})
+						: (attributedHeaders ?? {});
+					if (admitted) {
+						const receiptHeader = "x-openshell-middleware-egress-receipt";
+						if (Object.keys(headers).some((name) => name.toLowerCase() === receiptHeader)) {
+							throw new ManagedAdmissionError("reserved_receipt_header");
+						}
+						headers[receiptHeader] = Buffer.from(admitted.receipt).toString("ascii");
+					}
+					return headers;
 				},
 			});
 		},
@@ -359,6 +412,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 	});
 
+	const managedCompactionStream: StreamFn | undefined = options.managedAdmission
+		? async (requestModel, requestContext, requestOptions) => {
+				const runner = extensionRunnerRef.current;
+				if (!runner) throw new ManagedAdmissionError("admission_unavailable");
+				const admitted = await admitModelContext(
+					runner,
+					requestModel,
+					requestContext,
+					"compaction",
+					requestOptions?.signal,
+				);
+				admittedRequests.set(admitted.context, admitted);
+				return agent.streamFunction(requestModel, admitted.context, requestOptions);
+			}
+		: undefined;
+
 	// Restore messages if session has existing data
 	if (hasExistingSession) {
 		agent.state.messages = existingSession.messages;
@@ -382,6 +451,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		resourceLoader,
 		customTools: options.customTools,
 		modelRuntime,
+		managedAdmission: options.managedAdmission,
+		managedAdmissionState,
+		managedCompactionStream,
 		initialActiveToolNames,
 		allowedToolNames,
 		excludedToolNames,
