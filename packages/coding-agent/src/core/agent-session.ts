@@ -878,7 +878,25 @@ export class AgentSession {
 					replacement.content == null
 						? ({ ...replacement, content: [] } as AgentMessage)
 						: replacement;
-				this._replaceMessageInPlace(event.message, normalized);
+				const origin: MessageOrigin | undefined =
+					normalized.role === "user"
+						? "user"
+						: normalized.role === "assistant"
+							? "assistant"
+							: normalized.role === "toolResult"
+								? "tool_result"
+								: normalized.role === "custom"
+									? "extension_message"
+									: undefined;
+				if (!origin) {
+					this._replaceMessageInPlace(event.message, normalized);
+				} else {
+					try {
+						this._replaceMessageInPlace(event.message, await this._admitAppend(normalized, origin));
+					} catch {
+						// Preserve the already-admitted original message.
+					}
+				}
 			}
 		} else if (event.type === "tool_execution_start") {
 			const extensionEvent: ToolExecutionStartEvent = {

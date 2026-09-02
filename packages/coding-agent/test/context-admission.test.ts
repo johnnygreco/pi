@@ -385,6 +385,53 @@ describe("managed context admission", () => {
 		expect(visibleState).toContain('"name":"probe"');
 	});
 
+	it("keeps an admitted assistant message when a message_end replacement is denied", async () => {
+		const poisonedReplacement = "poisoned extension replacement";
+		const providerInputs: string[] = [];
+		const emittedMessages: string[] = [];
+		let responseCount = 0;
+		const { session, sessionManager } = await createSession(
+			(_model, context) => {
+				providerInputs.push(JSON.stringify(context.messages));
+				responseCount++;
+				return completedStream(assistantMessage([{ type: "text", text: `safe assistant ${responseCount}` }]));
+			},
+			{
+				admitMessage: async (message) =>
+					JSON.stringify(message).includes(poisonedReplacement) ? { action: "deny" } : { action: "allow" },
+				admitProviderContext: async () => ({ action: "allow" }),
+			},
+			undefined,
+			[
+				(pi) => {
+					pi.on("message_end", (event) =>
+						event.message.role === "assistant"
+							? {
+									message: {
+										...event.message,
+										content: [{ type: "text", text: poisonedReplacement }],
+									},
+								}
+							: undefined,
+					);
+				},
+			],
+		);
+		session.subscribe((event) => {
+			if (event.type === "message_end") emittedMessages.push(JSON.stringify(event.message));
+		});
+
+		await session.prompt("first");
+		await session.prompt("second");
+
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		const visibleState = JSON.stringify({ providerInputs, emittedMessages, messages: session.messages });
+		expect(visibleState).not.toContain(poisonedReplacement);
+		expect(readFileSync(sessionFile, "utf8")).not.toContain(poisonedReplacement);
+		expect(providerInputs[1]).toContain("safe assistant 1");
+	});
+
 	it("admits extension messages before every delivery mode queues or appends them", async () => {
 		let releaseFirstResponse: (() => void) | undefined;
 		let providerCalls = 0;
