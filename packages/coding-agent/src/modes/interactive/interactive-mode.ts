@@ -54,7 +54,12 @@ import {
 	getDocsPath,
 	VERSION,
 } from "../../config.ts";
-import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	ContextAdmissionDeniedError,
+	parseSkillBlock,
+} from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
 import {
@@ -1112,8 +1117,7 @@ export class InteractiveMode {
 			try {
 				await this.session.prompt(initialMessage, { images: initialImages });
 			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				this.showError(errorMessage);
+				this.showSubmissionError(error);
 			}
 		}
 
@@ -1122,8 +1126,7 @@ export class InteractiveMode {
 				try {
 					await this.session.prompt(message);
 				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-					this.showError(errorMessage);
+					this.showSubmissionError(error);
 				}
 			}
 		}
@@ -1132,10 +1135,13 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				await this.session.prompt(userInput);
+				await this.session.prompt(userInput, {
+					preflightResult: (success) => {
+						if (success) this.editor.addToHistory?.(userInput);
+					},
+				});
 			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				this.showError(errorMessage);
+				this.showSubmissionError(error);
 			}
 		}
 	}
@@ -2895,7 +2901,10 @@ export class InteractiveMode {
 			"app.message.copy",
 			() => void this.handleCopyCommand({ flashConfirmation: true, preferSelection: true }),
 		);
-		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
+		this.defaultEditor.onAction("app.message.followUp", () => {
+			const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
+			void this.handleSubmission(() => this.handleFollowUp(), text || undefined);
+		});
 		this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());
 		this.defaultEditor.onAction("app.session.new", () => this.handleClearCommand());
 		this.defaultEditor.onAction("app.session.tree", () => this.showTreeSelector());
@@ -2962,7 +2971,7 @@ export class InteractiveMode {
 	}
 
 	private setupEditorSubmitHandler(): void {
-		this.defaultEditor.onSubmit = async (text: string) => {
+		const submit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
 
@@ -3123,9 +3132,9 @@ export class InteractiveMode {
 			// Queue input during compaction (extension commands execute immediately)
 			if (this.session.isCompacting) {
 				if (this.isExtensionCommand(text)) {
-					this.editor.addToHistory?.(text);
 					this.editor.setText("");
 					await this.session.prompt(text);
+					this.editor.addToHistory?.(text);
 				} else {
 					this.queueCompactionMessage(text, "steer");
 				}
@@ -3135,9 +3144,13 @@ export class InteractiveMode {
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
 			if (this.session.isStreaming) {
-				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
+				await this.session.prompt(text, {
+					streamingBehavior: "steer",
+					preflightResult: (success) => {
+						if (success) this.editor.addToHistory?.(text);
+					},
+				});
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				return;
@@ -3152,8 +3165,8 @@ export class InteractiveMode {
 			} else {
 				this.pendingUserInputs.push(text);
 			}
-			this.editor.addToHistory?.(text);
 		};
+		this.defaultEditor.onSubmit = (text: string) => this.handleSubmission(() => submit(text), text);
 	}
 
 	private subscribeToAgent(): void {
@@ -4129,9 +4142,9 @@ export class InteractiveMode {
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
 			if (this.isExtensionCommand(text)) {
-				this.editor.addToHistory?.(text);
 				this.editor.setText("");
 				await this.session.prompt(text);
+				this.editor.addToHistory?.(text);
 			} else {
 				this.queueCompactionMessage(text, "followUp");
 			}
@@ -4141,9 +4154,13 @@ export class InteractiveMode {
 		// Alt+Enter queues a follow-up message (waits until agent finishes)
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.session.isStreaming) {
-			this.editor.addToHistory?.(text);
 			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
+			await this.session.prompt(text, {
+				streamingBehavior: "followUp",
+				preflightResult: (success) => {
+					if (success) this.editor.addToHistory?.(text);
+				},
+			});
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}
@@ -4274,6 +4291,27 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0));
 		this.ui.requestRender();
+	}
+
+	private showSubmissionError(error: unknown, prefix?: string): void {
+		if (error instanceof ContextAdmissionDeniedError) {
+			const detail = error.reason ? `: ${error.reason}` : "";
+			this.showError(`Message denied by context admission${detail}`);
+			return;
+		}
+		const message = error instanceof Error ? error.message : String(error);
+		this.showError(prefix ? `${prefix}: ${message}` : message);
+	}
+
+	private async handleSubmission(submit: () => Promise<void>, restoreText?: string): Promise<void> {
+		try {
+			await submit();
+		} catch (error) {
+			if (!(error instanceof ContextAdmissionDeniedError) && restoreText !== undefined) {
+				this.editor.setText(restoreText);
+			}
+			this.showSubmissionError(error);
+		}
 	}
 
 	showWarning(warningMessage: string): void {
@@ -4407,7 +4445,6 @@ export class InteractiveMode {
 
 	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
 		this.compactionQueuedMessages.push({ text, mode });
-		this.editor.addToHistory?.(text);
 		this.editor.setText("");
 		this.updatePendingMessagesDisplay();
 		this.showStatus("Queued message for after compaction");
@@ -4431,22 +4468,35 @@ export class InteractiveMode {
 		const queuedMessages = [...this.compactionQueuedMessages];
 		this.compactionQueuedMessages = [];
 		this.updatePendingMessagesDisplay();
-
-		const restoreQueue = (error: unknown) => {
-			this.session.clearQueue();
-			this.compactionQueuedMessages = queuedMessages;
-			this.updatePendingMessagesDisplay();
-			this.showError(
-				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
-			);
+		let lastAttemptedIndex = -1;
+		const acceptedMessages = new Set<CompactionQueuedMessage>();
+		const markAttempted = (message: CompactionQueuedMessage) => {
+			lastAttemptedIndex = Math.max(lastAttemptedIndex, queuedMessages.indexOf(message));
 		};
 
+		const restoreQueue = (error: unknown, failedMessage?: CompactionQueuedMessage) => {
+			const failedIndex = failedMessage ? queuedMessages.indexOf(failedMessage) : -1;
+			const failedMessageAccepted = failedMessage !== undefined && acceptedMessages.has(failedMessage);
+			const restoreIndex =
+				failedIndex === -1
+					? queuedMessages.length
+					: failedMessageAccepted
+						? lastAttemptedIndex + 1
+						: error instanceof ContextAdmissionDeniedError
+							? failedIndex + 1
+							: failedIndex;
+			this.compactionQueuedMessages = queuedMessages.slice(restoreIndex);
+			this.updatePendingMessagesDisplay();
+			this.showSubmissionError(error, `Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}`);
+		};
+
+		let activeMessage: CompactionQueuedMessage | undefined;
 		try {
 			if (options?.willRetry) {
 				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
+					activeMessage = message;
+					markAttempted(message);
 					if (this.isExtensionCommand(message.text)) {
 						await this.session.prompt(message.text);
 					} else if (message.mode === "followUp") {
@@ -4454,6 +4504,8 @@ export class InteractiveMode {
 					} else {
 						await this.session.steer(message.text);
 					}
+					acceptedMessages.add(message);
+					this.editor.addToHistory?.(message.text);
 				}
 				this.updatePendingMessagesDisplay();
 				return;
@@ -4464,7 +4516,11 @@ export class InteractiveMode {
 			if (firstPromptIndex === -1) {
 				// All extension commands - execute them all
 				for (const message of queuedMessages) {
+					activeMessage = message;
+					markAttempted(message);
 					await this.session.prompt(message.text);
+					acceptedMessages.add(message);
+					this.editor.addToHistory?.(message.text);
 				}
 				return;
 			}
@@ -4475,18 +4531,51 @@ export class InteractiveMode {
 			const rest = queuedMessages.slice(firstPromptIndex + 1);
 
 			for (const message of preCommands) {
+				activeMessage = message;
+				markAttempted(message);
 				await this.session.prompt(message.text);
+				acceptedMessages.add(message);
+				this.editor.addToHistory?.(message.text);
 			}
 
 			// Start a prompt when idle, or queue it into a run still finishing compaction.
+			let resolveFirstPromptPreflight = (_success: boolean): void => {};
+			let firstPromptAccepted = false;
+			const firstPromptPreflight = new Promise<boolean>((resolve) => {
+				resolveFirstPromptPreflight = resolve;
+			});
 			const promptPromise = this.session
-				.prompt(firstPrompt.text, { streamingBehavior: firstPrompt.mode })
+				.prompt(firstPrompt.text, {
+					streamingBehavior: firstPrompt.mode,
+					preflightResult: (success) => {
+						if (success) {
+							firstPromptAccepted = true;
+							acceptedMessages.add(firstPrompt);
+							this.editor.addToHistory?.(firstPrompt.text);
+						}
+						resolveFirstPromptPreflight(success);
+					},
+				})
 				.catch((error) => {
-					restoreQueue(error);
+					if (firstPromptAccepted) {
+						this.showSubmissionError(
+							error,
+							`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}`,
+						);
+					} else {
+						restoreQueue(error, firstPrompt);
+					}
 				});
+			markAttempted(firstPrompt);
+			if (!(await firstPromptPreflight)) {
+				await promptPromise;
+				return;
+			}
 
 			// Queue remaining messages
 			for (const message of rest) {
+				activeMessage = message;
+				markAttempted(message);
 				if (this.isExtensionCommand(message.text)) {
 					await this.session.prompt(message.text);
 				} else if (message.mode === "followUp") {
@@ -4494,11 +4583,13 @@ export class InteractiveMode {
 				} else {
 					await this.session.steer(message.text);
 				}
+				acceptedMessages.add(message);
+				this.editor.addToHistory?.(message.text);
 			}
 			this.updatePendingMessagesDisplay();
 			void promptPromise;
 		} catch (error) {
-			restoreQueue(error);
+			restoreQueue(error, activeMessage);
 		}
 	}
 
@@ -6537,7 +6628,11 @@ export class InteractiveMode {
 			);
 
 			// Record the result in session
-			this.session.recordBashResult(command, result, { excludeFromContext });
+			try {
+				await this.session.recordBashResult(command, result, { excludeFromContext });
+			} catch (error) {
+				this.showSubmissionError(error, "Bash command failed");
+			}
 			this.bashComponent = undefined;
 			this.ui.requestRender();
 			return;
@@ -6581,7 +6676,7 @@ export class InteractiveMode {
 			if (this.bashComponent) {
 				this.bashComponent.setComplete(undefined, false);
 			}
-			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+			this.showSubmissionError(error, "Bash command failed");
 		}
 
 		this.bashComponent = undefined;

@@ -1,6 +1,10 @@
 #!/usr/bin/env node
-import { setupCli } from "./cli/setup.ts";
-import { main } from "./main.ts";
+/**
+ * CLI entry point for the refactored coding agent.
+ * Uses main.ts with AgentSession and new mode modules.
+ *
+ * Test with: npx tsx src/cli-new.ts [args...]
+ */
+import { runCli } from "./cli-runtime.ts";
 
-setupCli();
-main(process.argv.slice(2));
+runCli(process.argv.slice(2));

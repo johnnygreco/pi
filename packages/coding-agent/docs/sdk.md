@@ -179,6 +179,43 @@ session = runtime.session;
 unsubscribe = session.subscribe(() => {});
 ```
 
+### Trusted Runtime Admission
+
+Runtime integrations that need Pi's complete CLI and TUI can call `runCli()`
+instead of rebuilding the command-line harness. With no options, this is the
+same entrypoint used by the `pi` executable. A launcher can install a trusted
+runtime extension while leaving Pi's argument parsing, settings, resources,
+tools, modes, compaction, and session management unchanged:
+
+```typescript
+import {
+  type ContextAdmission,
+  type RuntimeExtension,
+  runCli,
+} from "@earendil-works/pi-coding-agent";
+
+const runtimeExtension: RuntimeExtension = {
+  createContextAdmission: (sessionManager): ContextAdmission =>
+    createAdmissionForSession(sessionManager.getSessionId()),
+};
+
+await runCli(process.argv.slice(2), {
+  runtimeExtension,
+});
+```
+
+`ContextAdmission` exposes two mandatory decision points:
+
+- each supported history append before it enters live context or session
+  storage, identified by a generic `MessageOrigin`
+- the exact context immediately before each provider request is serialized
+
+It can also transform the outbound headers for the admitted provider context.
+The runtime extension owns the policy, transport, and trust model behind these
+decisions. Runtime extensions are installed only by the launcher and are not
+affected by user extension discovery or `--no-extensions`. Ordinary extensions
+remain trusted in-process code and run through their normal lifecycle.
+
 ### Prompting and Message Queueing
 
 `PromptOptions` controls prompt expansion, queueing behavior while streaming, and prompt preflight notifications:

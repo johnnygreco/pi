@@ -1,6 +1,7 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { Container } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
+import { ContextAdmissionDeniedError } from "../src/core/agent-session.ts";
 import type { SessionEntry } from "../src/core/session-manager.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -231,9 +232,12 @@ describe("InteractiveMode compaction events", () => {
 	test("preserves steering behavior when flushing into an active agent run", async () => {
 		const fakeThis = {
 			compactionQueuedMessages: [{ text: "change direction", mode: "steer" as const }],
+			editor: { addToHistory: vi.fn() },
 			session: {
 				clearQueue: vi.fn(),
-				prompt: vi.fn().mockResolvedValue(undefined),
+				prompt: vi.fn().mockImplementation(async (_text, options) => {
+					(options as { preflightResult?: (success: boolean) => void })?.preflightResult?.(true);
+				}),
 				steer: vi.fn().mockResolvedValue(undefined),
 				followUp: vi.fn().mockResolvedValue(undefined),
 			},
@@ -249,8 +253,165 @@ describe("InteractiveMode compaction events", () => {
 
 		await flushCompactionQueue.call(fakeThis, { willRetry: false });
 
-		expect(fakeThis.session.prompt).toHaveBeenCalledWith("change direction", { streamingBehavior: "steer" });
+		expect(fakeThis.session.prompt).toHaveBeenCalledWith(
+			"change direction",
+			expect.objectContaining({ streamingBehavior: "steer" }),
+		);
 		expect(fakeThis.compactionQueuedMessages).toEqual([]);
 		expect(fakeThis.showError).not.toHaveBeenCalled();
+		expect(fakeThis.editor.addToHistory).toHaveBeenCalledWith("change direction");
+	});
+
+	test("drops a denied compaction message while preserving unrelated queued input", async () => {
+		const denial = new ContextAdmissionDeniedError("blocked after compaction");
+		const fakeThis = {
+			compactionQueuedMessages: [
+				{ text: "blocked message", mode: "steer" as const },
+				{ text: "unrelated message", mode: "followUp" as const },
+			],
+			editor: { addToHistory: vi.fn() },
+			session: {
+				clearQueue: vi.fn(),
+				prompt: vi.fn().mockImplementation(async (_text, options) => {
+					(options as { preflightResult?: (success: boolean) => void })?.preflightResult?.(false);
+					throw denial;
+				}),
+				steer: vi.fn().mockResolvedValue(undefined),
+				followUp: vi.fn().mockResolvedValue(undefined),
+			},
+			isExtensionCommand: vi.fn().mockReturnValue(false),
+			updatePendingMessagesDisplay: vi.fn(),
+			showSubmissionError: vi.fn(),
+		};
+		const flushCompactionQueue = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
+			this: typeof fakeThis,
+			options?: { willRetry?: boolean },
+		) => Promise<void>;
+
+		await expect(flushCompactionQueue.call(fakeThis, { willRetry: false })).resolves.toBeUndefined();
+
+		expect(fakeThis.compactionQueuedMessages).toEqual([{ text: "unrelated message", mode: "followUp" }]);
+		expect(fakeThis.session.clearQueue).not.toHaveBeenCalled();
+		expect(fakeThis.editor.addToHistory).not.toHaveBeenCalledWith("blocked message");
+		expect(fakeThis.editor.addToHistory).not.toHaveBeenCalledWith("unrelated message");
+		expect(fakeThis.showSubmissionError).toHaveBeenCalledWith(denial, "Failed to send queued messages");
+	});
+
+	test("does not restore accepted messages when a later compaction message is denied", async () => {
+		const denial = new ContextAdmissionDeniedError("blocked later message");
+		const fakeThis = {
+			compactionQueuedMessages: [
+				{ text: "accepted first", mode: "steer" as const },
+				{ text: "blocked second", mode: "followUp" as const },
+				{ text: "pending third", mode: "steer" as const },
+			],
+			editor: { addToHistory: vi.fn() },
+			session: {
+				clearQueue: vi.fn(),
+				prompt: vi.fn().mockImplementation(async (_text, options) => {
+					(options as { preflightResult?: (success: boolean) => void })?.preflightResult?.(true);
+				}),
+				steer: vi.fn().mockResolvedValue(undefined),
+				followUp: vi.fn().mockRejectedValue(denial),
+			},
+			isExtensionCommand: vi.fn().mockReturnValue(false),
+			updatePendingMessagesDisplay: vi.fn(),
+			showSubmissionError: vi.fn(),
+		};
+		const flushCompactionQueue = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
+			this: typeof fakeThis,
+			options?: { willRetry?: boolean },
+		) => Promise<void>;
+
+		await expect(flushCompactionQueue.call(fakeThis, { willRetry: false })).resolves.toBeUndefined();
+
+		expect(fakeThis.compactionQueuedMessages).toEqual([{ text: "pending third", mode: "steer" }]);
+		expect(fakeThis.session.clearQueue).not.toHaveBeenCalled();
+		expect(fakeThis.editor.addToHistory).toHaveBeenCalledWith("accepted first");
+		expect(fakeThis.editor.addToHistory).not.toHaveBeenCalledWith("blocked second");
+		expect(fakeThis.editor.addToHistory).not.toHaveBeenCalledWith("pending third");
+		expect(fakeThis.session.steer).not.toHaveBeenCalled();
+	});
+
+	test("retries only the failed and unattempted suffix after an ordinary error", async () => {
+		const failure = new Error("temporary queue failure");
+		const fakeThis = {
+			compactionQueuedMessages: [
+				{ text: "accepted first", mode: "steer" as const },
+				{ text: "failed second", mode: "followUp" as const },
+				{ text: "pending third", mode: "steer" as const },
+			],
+			editor: { addToHistory: vi.fn() },
+			session: {
+				clearQueue: vi.fn(),
+				prompt: vi.fn().mockImplementation(async (_text, options) => {
+					(options as { preflightResult?: (success: boolean) => void })?.preflightResult?.(true);
+				}),
+				steer: vi.fn().mockResolvedValue(undefined),
+				followUp: vi.fn().mockRejectedValue(failure),
+			},
+			isExtensionCommand: vi.fn().mockReturnValue(false),
+			updatePendingMessagesDisplay: vi.fn(),
+			showSubmissionError: vi.fn(),
+		};
+		const flushCompactionQueue = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
+			this: typeof fakeThis,
+			options?: { willRetry?: boolean },
+		) => Promise<void>;
+
+		await expect(flushCompactionQueue.call(fakeThis, { willRetry: false })).resolves.toBeUndefined();
+
+		expect(fakeThis.compactionQueuedMessages).toEqual([
+			{ text: "failed second", mode: "followUp" },
+			{ text: "pending third", mode: "steer" },
+		]);
+		expect(fakeThis.session.clearQueue).not.toHaveBeenCalled();
+		expect(fakeThis.editor.addToHistory).toHaveBeenCalledWith("accepted first");
+		expect(fakeThis.editor.addToHistory).not.toHaveBeenCalledWith("failed second");
+		expect(fakeThis.editor.addToHistory).not.toHaveBeenCalledWith("pending third");
+	});
+
+	test("does not mutate the queue when the accepted first prompt later fails", async () => {
+		let rejectFirstPrompt: ((error: Error) => void) | undefined;
+		const firstPromptFailure = new Promise<void>((_resolve, reject) => {
+			rejectFirstPrompt = reject;
+		});
+		const fakeThis = {
+			compactionQueuedMessages: [
+				{ text: "accepted first", mode: "steer" as const },
+				{ text: "accepted second", mode: "followUp" as const },
+			],
+			editor: { addToHistory: vi.fn() },
+			session: {
+				clearQueue: vi.fn(),
+				prompt: vi.fn().mockImplementation(async (_text, options) => {
+					(options as { preflightResult?: (success: boolean) => void })?.preflightResult?.(true);
+					await firstPromptFailure;
+				}),
+				steer: vi.fn().mockResolvedValue(undefined),
+				followUp: vi.fn().mockResolvedValue(undefined),
+			},
+			isExtensionCommand: vi.fn().mockReturnValue(false),
+			updatePendingMessagesDisplay: vi.fn(),
+			showSubmissionError: vi.fn(),
+		};
+		const flushCompactionQueue = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
+			this: typeof fakeThis,
+			options?: { willRetry?: boolean },
+		) => Promise<void>;
+
+		await flushCompactionQueue.call(fakeThis, { willRetry: false });
+		rejectFirstPrompt?.(new Error("provider failed after preflight"));
+		await firstPromptFailure.catch(() => {});
+		await Promise.resolve();
+
+		expect(fakeThis.compactionQueuedMessages).toEqual([]);
+		expect(fakeThis.session.clearQueue).not.toHaveBeenCalled();
+		expect(fakeThis.editor.addToHistory).toHaveBeenCalledWith("accepted first");
+		expect(fakeThis.editor.addToHistory).toHaveBeenCalledWith("accepted second");
+		expect(fakeThis.showSubmissionError).toHaveBeenCalledWith(
+			expect.objectContaining({ message: "provider failed after preflight" }),
+			"Failed to send queued messages",
+		);
 	});
 });

@@ -291,6 +291,18 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * The hook receives the agent abort signal and is responsible for honoring it.
 	 */
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+
+	/**
+	 * Called after a tool result message is finalized, before it is emitted or appended to context.
+	 * The returned message replaces the finalized result in full.
+	 */
+	beforeToolResultAppend?: (message: ToolResultMessage, signal?: AbortSignal) => Promise<ToolResultMessage>;
+
+	/**
+	 * Called after an assistant message is finalized, before it is emitted or appended to context.
+	 * The returned message replaces the finalized message in full.
+	 */
+	beforeAssistantMessageAppend?: (message: AssistantMessage, signal?: AbortSignal) => Promise<AssistantMessage>;
 }
 
 /**

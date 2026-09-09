@@ -29,11 +29,13 @@ import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
+	Context,
 	ImageContent,
 	Model,
 	ProviderHeaders,
 	TextContent,
 	Usage,
+	UserMessage,
 } from "@earendil-works/pi-ai/compat";
 import {
 	clampThinkingLevel,
@@ -96,7 +98,12 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
-import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
+import type {
+	BashExecutionMessage,
+	BranchSummaryMessage,
+	CompactionSummaryMessage,
+	CustomMessage,
+} from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
@@ -227,6 +234,44 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Mandatory admission boundary for managed runtimes. */
+	contextAdmission?: ContextAdmission;
+}
+
+export type ContextAdmissionResult<T> = { action: "allow"; message?: T } | { action: "deny"; reason?: string };
+
+export type ProviderContextAdmissionResult =
+	| { action: "allow"; context?: Context }
+	| { action: "deny"; reason?: string };
+
+export type MessageOrigin =
+	| "user"
+	| "tool_result"
+	| "assistant"
+	| "compaction_summary"
+	| "branch_summary"
+	| "extension_message"
+	| "bash_execution";
+
+export interface ContextAdmission {
+	admitMessage<T extends AgentMessage>(
+		message: T,
+		context: { origin: MessageOrigin; source?: InputSource },
+	): Promise<ContextAdmissionResult<T>>;
+	/** Admit the exact context immediately before any provider request is serialized. */
+	admitProviderContext(context: Context): Promise<ProviderContextAdmissionResult>;
+	/** Transform headers for the exact context of the outbound provider request. */
+	transformProviderHeaders?(headers: ProviderHeaders, context: Context): Promise<ProviderHeaders>;
+}
+
+export class ContextAdmissionDeniedError extends Error {
+	readonly reason?: string;
+
+	constructor(reason?: string) {
+		super(reason ?? "Message blocked by context admission");
+		this.name = "ContextAdmissionDeniedError";
+		this.reason = reason;
+	}
 }
 
 export interface ExtensionBindings {
@@ -360,6 +405,7 @@ export class AgentSession {
 	private _excludedToolNames?: Set<string>;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
+	private _contextAdmission?: ContextAdmission;
 	private _extensionUIContext?: ExtensionUIContext;
 	private _extensionMode: ExtensionMode = "print";
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
@@ -396,6 +442,7 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._contextAdmission = config.contextAdmission;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -537,6 +584,37 @@ export class AgentSession {
 				usage: hookResult?.usage,
 			};
 		};
+
+		if (this._contextAdmission) {
+			this.agent.beforeToolResultAppend = async (message) => {
+				try {
+					return await this._admitAppend(message, "tool_result");
+				} catch {
+					// Admission failures are denied below.
+				}
+
+				return {
+					role: "toolResult",
+					toolCallId: message.toolCallId,
+					toolName: message.toolName,
+					content: [{ type: "text", text: "[Tool result blocked by context admission]" }],
+					isError: true,
+					timestamp: message.timestamp,
+				};
+			};
+			this.agent.beforeAssistantMessageAppend = async (message) => {
+				try {
+					return await this._admitAppend(message, "assistant");
+				} catch {
+					return {
+						...message,
+						content: [{ type: "text", text: "[Assistant message blocked by context admission]" }],
+						stopReason: "stop",
+						errorMessage: undefined,
+					};
+				}
+			};
+		}
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
@@ -818,7 +896,25 @@ export class AgentSession {
 					replacement.content == null
 						? ({ ...replacement, content: [] } as AgentMessage)
 						: replacement;
-				this._replaceMessageInPlace(event.message, normalized);
+				const origin: MessageOrigin | undefined =
+					normalized.role === "user"
+						? "user"
+						: normalized.role === "assistant"
+							? "assistant"
+							: normalized.role === "toolResult"
+								? "tool_result"
+								: normalized.role === "custom"
+									? "extension_message"
+									: undefined;
+				if (!origin) {
+					this._replaceMessageInPlace(event.message, normalized);
+				} else {
+					try {
+						this._replaceMessageInPlace(event.message, await this._admitAppend(normalized, origin));
+					} catch {
+						// Preserve the already-admitted original message.
+					}
+				}
 			}
 		} else if (event.type === "tool_execution_start") {
 			const extensionEvent: ToolExecutionStartEvent = {
@@ -1147,6 +1243,54 @@ export class AgentSession {
 		return this.agent.hasQueuedMessages();
 	}
 
+	private _createUserMessage(text: string, images?: ImageContent[]): UserMessage {
+		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
+		if (images) {
+			content.push(...images);
+		}
+		return { role: "user", content, timestamp: Date.now() };
+	}
+
+	private async _admitAppend<T extends AgentMessage>(
+		message: T,
+		origin: MessageOrigin,
+		source?: InputSource,
+	): Promise<T> {
+		if (!this._contextAdmission) return message;
+		const result = await this._contextAdmission.admitMessage(message, source ? { origin, source } : { origin });
+		if (result.action === "deny") {
+			throw new ContextAdmissionDeniedError(result.reason);
+		}
+		return result.message ?? message;
+	}
+
+	private async _admitCompactionSummary(summary: string, tokensBefore: number): Promise<string> {
+		const message = await this._admitAppend(
+			{
+				role: "compactionSummary",
+				summary,
+				tokensBefore,
+				timestamp: Date.now(),
+			} satisfies CompactionSummaryMessage,
+			"compaction_summary",
+		);
+		return message.summary;
+	}
+
+	private _getUserMessageParts(message: UserMessage): { text: string; images?: ImageContent[] } {
+		if (typeof message.content === "string") {
+			return { text: message.content };
+		}
+		const images = message.content.filter((part): part is ImageContent => part.type === "image");
+		return {
+			text: message.content
+				.filter((part): part is TextContent => part.type === "text")
+				.map((part) => part.text)
+				.join("\n"),
+			images: images.length > 0 ? images : undefined,
+		};
+	}
+
 	private async _runInputHandlers(
 		text: string,
 		images: ImageContent[] | undefined,
@@ -1210,7 +1354,8 @@ export class AgentSession {
 				preflightResult?.(true);
 				return;
 			}
-			const { text: currentText, images: currentImages } = processedInput;
+			const currentText = processedInput.text;
+			let currentImages = processedInput.images;
 
 			// Expand skill commands (/skill:name args) and prompt templates (/template args)
 			let expandedText = currentText;
@@ -1218,18 +1363,32 @@ export class AgentSession {
 				expandedText = this._expandSkillCommand(expandedText);
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
+			const streamingBehavior = options?.streamingBehavior;
+			if (this.isStreaming && !streamingBehavior) {
+				throw new Error(
+					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+				);
+			}
 
-			// If streaming, queue via steer() or followUp() based on option
+			let admittedMessage: UserMessage | undefined;
+			if (this._contextAdmission) {
+				admittedMessage = await this._admitAppend(
+					this._createUserMessage(expandedText, currentImages),
+					"user",
+					options?.source ?? "interactive",
+				);
+				const admittedParts = this._getUserMessageParts(admittedMessage);
+				expandedText = admittedParts.text;
+				currentImages = admittedParts.images;
+			}
+
+			// If streaming, queue the admitted message via steer() or followUp().
 			if (this.isStreaming) {
-				if (!options?.streamingBehavior) {
-					throw new Error(
-						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
-					);
-				}
-				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+				const queuedMessage = admittedMessage ?? this._createUserMessage(expandedText, currentImages);
+				if (streamingBehavior === "followUp") {
+					this._queueFollowUp(queuedMessage);
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					this._queueSteer(queuedMessage);
 				}
 				preflightResult?.(true);
 				return;
@@ -1269,16 +1428,8 @@ export class AgentSession {
 			// Build messages array (custom message if any, then user message)
 			messages = [];
 
-			// Add user message
-			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
-			if (currentImages) {
-				userContent.push(...currentImages);
-			}
-			messages.push({
-				role: "user",
-				content: userContent,
-				timestamp: Date.now(),
-			});
+			// Add admitted user message, or standard Pi's message when admission is disabled.
+			messages.push(admittedMessage ?? this._createUserMessage(expandedText, currentImages));
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this._pendingNextTurnMessages) {
@@ -1296,15 +1447,20 @@ export class AgentSession {
 			// Add all custom messages from extensions
 			if (result?.messages) {
 				for (const msg of result.messages) {
-					messages.push({
-						role: "custom",
-						customType: msg.customType,
-						// Untyped extensions can pass null/missing content; normalize at ingestion.
-						content: msg.content ?? [],
-						display: msg.display,
-						details: msg.details,
-						timestamp: Date.now(),
-					});
+					messages.push(
+						await this._admitAppend(
+							{
+								role: "custom",
+								customType: msg.customType,
+								// Untyped extensions can pass null/missing content; normalize at ingestion.
+								content: msg.content ?? [],
+								display: msg.display,
+								details: msg.details,
+								timestamp: Date.now(),
+							} satisfies CustomMessage,
+							"extension_message",
+						),
+					);
 				}
 			}
 			// Apply extension-modified system prompt, or reset to base
@@ -1409,11 +1565,16 @@ export class AgentSession {
 
 		let expandedText = this._expandSkillCommand(processedInput.text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+		const message = await this._admitAppend(
+			this._createUserMessage(expandedText, processedInput.images),
+			"user",
+			source,
+		);
 
 		if (behavior === "steer") {
-			await this._queueSteer(expandedText, processedInput.images);
+			this._queueSteer(message);
 		} else {
-			await this._queueFollowUp(expandedText, processedInput.images);
+			this._queueFollowUp(message);
 		}
 	}
 
@@ -1445,35 +1606,21 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private _queueSteer(message: UserMessage): void {
+		const text = contentText(message.content, "");
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
-		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		this.agent.steer(message);
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private _queueFollowUp(message: UserMessage): void {
+		const text = contentText(message.content, "");
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
-		}
-		this.agent.followUp({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		this.agent.followUp(message);
 	}
 
 	/**
@@ -1508,15 +1655,18 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
-		const appMessage = {
-			role: "custom" as const,
-			customType: message.customType,
-			// Untyped extensions can pass null/missing content; normalize at ingestion.
-			content: message.content ?? [],
-			display: message.display,
-			details: message.details,
-			timestamp: Date.now(),
-		} satisfies CustomMessage<T>;
+		const appMessage = await this._admitAppend(
+			{
+				role: "custom" as const,
+				customType: message.customType,
+				// Untyped extensions can pass null/missing content; normalize at ingestion.
+				content: message.content ?? [],
+				display: message.display,
+				details: message.details,
+				timestamp: Date.now(),
+			} satisfies CustomMessage<T>,
+			"extension_message",
+		);
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
@@ -2053,6 +2203,7 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
+			summary = await this._admitCompactionSummary(summary, tokensBefore);
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
@@ -2378,6 +2529,7 @@ export class AgentSession {
 				return false;
 			}
 
+			summary = await this._admitCompactionSummary(summary, tokensBefore);
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
@@ -3032,7 +3184,7 @@ export class AgentSession {
 				},
 			);
 
-			this.recordBashResult(command, result, options);
+			await this.recordBashResult(command, result, options);
 			return result;
 		} finally {
 			this._bashAbortControllers.delete(abortController);
@@ -3043,18 +3195,25 @@ export class AgentSession {
 	 * Record a bash execution result in session history.
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
-	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
-		const bashMessage: BashExecutionMessage = {
-			role: "bashExecution",
-			command,
-			output: result.output,
-			exitCode: result.exitCode,
-			cancelled: result.cancelled,
-			truncated: result.truncated,
-			fullOutputPath: result.fullOutputPath,
-			timestamp: Date.now(),
-			excludeFromContext: options?.excludeFromContext,
-		};
+	async recordBashResult(
+		command: string,
+		result: BashResult,
+		options?: { excludeFromContext?: boolean },
+	): Promise<void> {
+		const bashMessage = await this._admitAppend(
+			{
+				role: "bashExecution",
+				command,
+				output: result.output,
+				exitCode: result.exitCode,
+				cancelled: result.cancelled,
+				truncated: result.truncated,
+				fullOutputPath: result.fullOutputPath,
+				timestamp: Date.now(),
+				excludeFromContext: options?.excludeFromContext,
+			} satisfies BashExecutionMessage,
+			"bash_execution",
+		);
 
 		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
 		if (this.isStreaming) {
@@ -3284,6 +3443,16 @@ export class AgentSession {
 			// Summary is attached at the navigation target position (newLeafId), not the old branch
 			let summaryEntry: BranchSummaryEntry | undefined;
 			if (summaryText) {
+				const admittedSummary = await this._admitAppend(
+					{
+						role: "branchSummary",
+						summary: summaryText,
+						fromId: oldLeafId ?? "root",
+						timestamp: Date.now(),
+					} satisfies BranchSummaryMessage,
+					"branch_summary",
+				);
+				summaryText = admittedSummary.summary;
 				// Create summary at target position (can be null for root)
 				const summaryId = this.sessionManager.branchWithSummary(
 					newLeafId,

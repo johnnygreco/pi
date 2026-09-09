@@ -569,7 +569,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				});
 
 				if (eventResult?.result) {
-					session.recordBashResult(command.command, eventResult.result, {
+					await session.recordBashResult(command.command, eventResult.result, {
 						excludeFromContext: command.excludeFromContext,
 					});
 					return success(id, "bash", eventResult.result);

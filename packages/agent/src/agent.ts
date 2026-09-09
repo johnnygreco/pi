@@ -1,10 +1,12 @@
 import type {
+	AssistantMessage,
 	ImageContent,
 	Message,
 	Model,
 	SimpleStreamOptions,
 	TextContent,
 	ThinkingBudgets,
+	ToolResultMessage,
 	Transport,
 } from "@earendil-works/pi-ai";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
@@ -105,6 +107,8 @@ export interface AgentOptions {
 	onResponse?: SimpleStreamOptions["onResponse"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+	beforeToolResultAppend?: (message: ToolResultMessage, signal?: AbortSignal) => Promise<ToolResultMessage>;
+	beforeAssistantMessageAppend?: (message: AssistantMessage, signal?: AbortSignal) => Promise<AssistantMessage>;
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext, signal?: AbortSignal) => boolean | Promise<boolean>;
 	prepareNextTurn?: (
 		signal?: AbortSignal,
@@ -190,6 +194,8 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
+	public beforeToolResultAppend?: (message: ToolResultMessage, signal?: AbortSignal) => Promise<ToolResultMessage>;
+	public beforeAssistantMessageAppend?: (message: AssistantMessage, signal?: AbortSignal) => Promise<AssistantMessage>;
 	public shouldStopAfterTurn?: (
 		context: ShouldStopAfterTurnContext,
 		signal?: AbortSignal,
@@ -225,6 +231,8 @@ export class Agent {
 		this.onResponse = runtimeOptions.onResponse;
 		this.beforeToolCall = runtimeOptions.beforeToolCall;
 		this.afterToolCall = runtimeOptions.afterToolCall;
+		this.beforeToolResultAppend = runtimeOptions.beforeToolResultAppend;
+		this.beforeAssistantMessageAppend = runtimeOptions.beforeAssistantMessageAppend;
 		this.shouldStopAfterTurn = runtimeOptions.shouldStopAfterTurn;
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
 		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
@@ -457,6 +465,8 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
+			beforeToolResultAppend: this.beforeToolResultAppend,
+			beforeAssistantMessageAppend: this.beforeAssistantMessageAppend,
 			shouldStopAfterTurn: shouldStopAfterTurn
 				? async (context) => await shouldStopAfterTurn(context, this.signal)
 				: undefined,
